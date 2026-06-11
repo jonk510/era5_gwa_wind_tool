@@ -659,6 +659,13 @@ if "lat_input" not in st.session_state:
 if "lon_input" not in st.session_state:
     st.session_state["lon_input"] = 115.8605
 
+# Apply any pending map click BEFORE the sidebar widgets render.
+# (Streamlit forbids setting a widget key after it has been instantiated,
+# so we stage the click in _pending_* and apply it here at the top of the run.)
+if st.session_state.get("_pending_lat") is not None:
+    st.session_state["lat_input"] = st.session_state.pop("_pending_lat")
+    st.session_state["lon_input"] = st.session_state.pop("_pending_lon")
+
 # ── EPSG coordinate presets ───────────────────────────────────────────────────
 _EPSG_OPTIONS = {
     "WGS84 / Geographic (EPSG:4326)": None,
@@ -830,7 +837,9 @@ with col_map:
         returned_objects=["last_clicked"], key="site_map",
     )
 
-    # Handle map clicks (WGS84 mode only)
+    # Handle map clicks (WGS84 mode only).
+    # Write to _pending_* staging keys — NOT the widget keys directly —
+    # because widgets have already rendered by this point in the script.
     if not is_projected and _map_out and _map_out.get("last_clicked"):
         _click = _map_out["last_clicked"]
         _clat = round(_click["lat"], 4)
@@ -839,8 +848,8 @@ with col_map:
             round(st.session_state["lat_input"], 4),
             round(st.session_state["lon_input"], 4),
         ):
-            st.session_state["lat_input"] = _clat
-            st.session_state["lon_input"] = _clng
+            st.session_state["_pending_lat"] = _clat
+            st.session_state["_pending_lon"] = _clng
             st.session_state["era5_node"] = None
             st.session_state["gwa_node"] = None
             st.rerun()
