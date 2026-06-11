@@ -20,6 +20,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from pyproj import Transformer
 from scipy.optimize import brentq
 from scipy.signal import lfilter
 from scipy.special import gamma as sc_gamma
@@ -65,8 +66,7 @@ st.set_page_config(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-_END_YEAR = datetime.now().year - 1
-_START_YEAR = _END_YEAR - 9
+_LATEST_YEAR = datetime.now().year - 1   # last complete calendar year
 GWA_URL = "https://globalwindatlas.info/api/gwa/custom/Lib/"
 OPENMETEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 ESRI_TILES = (
@@ -202,9 +202,9 @@ def parse_gwc(text):
 # ── Data fetching (cached) ────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def fetch_era5(lat: float, lon: float):
+def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
     """
-    Fetch 10-year hourly ERA5 wind at 10m and 100m from Open-Meteo.
+    Fetch hourly ERA5 wind at 10m and 100m from Open-Meteo for the given year range.
     Returns (df, era5_lat, era5_lon) — the lat/lon are the actual ERA5 grid node
     coordinates used, which may differ from the input by up to ~0.125°.
     """
@@ -213,8 +213,8 @@ def fetch_era5(lat: float, lon: float):
         params={
             "latitude": lat,
             "longitude": lon,
-            "start_date": f"{_START_YEAR}-01-01",
-            "end_date": f"{_END_YEAR}-12-31",
+            "start_date": f"{start_year}-01-01",
+            "end_date": f"{end_year}-12-31",
             "hourly": "wind_speed_100m,wind_speed_10m,wind_gusts_10m",
             "wind_speed_unit": "ms",
             "timezone": "UTC",
@@ -443,29 +443,146 @@ def disaggregate_subhourly(
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-st.title("ERA5 + GWA Wind Resource Tool — 150 m")
-st.caption(
-    "Combines 10 years of ERA5 hourly wind variability with Global Wind Atlas "
-    "downscaled spatial accuracy, extrapolated to 150 m hub height."
-)
+st.markdown("""
+<style>
+.section-header {
+    border-left: 4px solid #1565C0;
+    padding-left: 12px;
+    margin: 28px 0 10px 0;
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #1E293B;
+}
+.synth-note {
+    background: #EFF6FF;
+    border-left: 4px solid #3B82F6;
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 6px 0 18px 0;
+    font-size: 0.83rem;
+    color: #1E3A5F;
+    line-height: 1.55;
+}
+.warn-note {
+    background: #FFFBEB;
+    border-left: 4px solid #F59E0B;
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 6px 0 18px 0;
+    font-size: 0.83rem;
+    color: #78350F;
+    line-height: 1.55;
+}
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    margin-right: 4px;
+    vertical-align: middle;
+}
+.badge-era5  { background: #DBEAFE; color: #1D4ED8; }
+.badge-gwa   { background: #D1FAE5; color: #065F46; }
+.badge-synth { background: #EDE9FE; color: #5B21B6; }
+.step-card {
+    background: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+}
+.step-num {
+    display: inline-block;
+    background: #1565C0;
+    color: white;
+    border-radius: 50%;
+    width: 22px;
+    height: 22px;
+    text-align: center;
+    line-height: 22px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    margin-right: 8px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div style="background: linear-gradient(135deg, #1565C0 0%, #0D47A1 100%);
+     border-radius: 10px; padding: 22px 28px; margin-bottom: 16px; color: white;">
+  <h2 style="margin:0; font-size:1.55rem; font-weight:700; letter-spacing:-0.3px;">
+    💨 ERA5 + GWA Wind Resource Tool
+  </h2>
+  <p style="margin:8px 0 0 0; opacity:0.88; font-size:0.92rem;">
+    10-year ERA5 hourly reanalysis &nbsp;&bull;&nbsp; Global Wind Atlas spatial accuracy
+    &nbsp;&bull;&nbsp; Extrapolated to <strong>150 m</strong> hub height
+  </p>
+</div>
+""", unsafe_allow_html=True)
 
 # ── Session state — persist grid node markers across re-renders ───────────────
 for _key in ("era5_node", "gwa_node", "_prev_lat", "_prev_lon"):
     if _key not in st.session_state:
         st.session_state[_key] = None
 
-# Sidebar
+# ── EPSG coordinate presets ───────────────────────────────────────────────────
+_EPSG_OPTIONS = {
+    "WGS84 / Geographic (EPSG:4326)": None,
+    "GDA2020 / MGA Zone 49 (EPSG:7849)": 7849,
+    "GDA2020 / MGA Zone 50 (EPSG:7850)": 7850,
+    "GDA2020 / MGA Zone 51 (EPSG:7851)": 7851,
+    "GDA94 / MGA Zone 49 (EPSG:28349)": 28349,
+    "GDA94 / MGA Zone 50 (EPSG:28350)": 28350,
+    "GDA94 / MGA Zone 51 (EPSG:28351)": 28351,
+    "UTM Zone 50S (EPSG:32750)": 32750,
+    "UTM Zone 51S (EPSG:32751)": 32751,
+    "Custom EPSG code": "custom",
+}
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Location")
-    lat = st.number_input(
-        "Latitude", value=-31.9505, min_value=-90.0, max_value=90.0,
-        step=0.0001, format="%.4f",
+    st.markdown("### 📍 Location")
+
+    crs_choice = st.selectbox(
+        "Coordinate system",
+        options=list(_EPSG_OPTIONS.keys()),
+        index=0,
+        help="Select the coordinate reference system for your input coordinates.",
     )
-    lon = st.number_input(
-        "Longitude", value=115.8605, min_value=-180.0, max_value=180.0,
-        step=0.0001, format="%.4f",
-    )
-    # Clear cached node markers when the user moves to a new location
+    epsg_code = _EPSG_OPTIONS[crs_choice]
+    if crs_choice == "Custom EPSG code":
+        epsg_code = st.number_input("EPSG code", value=32750, min_value=1, max_value=99999, step=1)
+
+    is_projected = epsg_code is not None and epsg_code != "custom"
+
+    if is_projected:
+        easting = st.number_input(
+            "Easting (m)", value=386000.0, step=100.0, format="%.1f",
+        )
+        northing = st.number_input(
+            "Northing (m)", value=6464000.0, step=100.0, format="%.1f",
+        )
+        try:
+            transformer = Transformer.from_crs(
+                f"EPSG:{epsg_code}", "EPSG:4326", always_xy=True
+            )
+            lon, lat = transformer.transform(easting, northing)
+            lat, lon = round(lat, 6), round(lon, 6)
+            st.caption(f"→ WGS84: **{lat:.5f}°N, {lon:.5f}°E**")
+        except Exception as _e:
+            st.error(f"Coordinate conversion failed: {_e}")
+            lat, lon = -31.9505, 115.8605
+    else:
+        lat = st.number_input(
+            "Latitude", value=-31.9505, min_value=-90.0, max_value=90.0,
+            step=0.0001, format="%.4f",
+        )
+        lon = st.number_input(
+            "Longitude", value=115.8605, min_value=-180.0, max_value=180.0,
+            step=0.0001, format="%.4f",
+        )
+
     if (st.session_state["_prev_lat"], st.session_state["_prev_lon"]) != (lat, lon):
         st.session_state["era5_node"] = None
         st.session_state["gwa_node"] = None
@@ -477,38 +594,55 @@ with st.sidebar:
     use_utc = st.checkbox("Show times in UTC", value=False)
     tz_display = "UTC" if use_utc else tz_detected
     st.caption(
-        f"Detected timezone: **{tz_detected}**"
-        + ("  *(overridden to UTC)*" if use_utc else "")
+        f"Detected: **{tz_detected}**"
+        + ("  *(UTC override active)*" if use_utc else "")
     )
+
+    st.divider()
+    st.markdown("### 📅 ERA5 Period")
+    _end_max = _LATEST_YEAR
+    _end_min = 1980
+    end_year = st.number_input(
+        "End year", value=_LATEST_YEAR, min_value=_end_min, max_value=_end_max, step=1,
+    )
+    n_years = st.slider(
+        "Number of years", min_value=1, max_value=min(end_year - 1979, 20),
+        value=min(10, end_year - 1979),
+    )
+    start_year = end_year - n_years + 1
+    st.caption(f"Period: **{start_year}–{end_year}** ({n_years} yr)")
+    _START_YEAR, _END_YEAR = start_year, end_year
+
     st.info(
-        f"**ERA5 period**\n{_START_YEAR} – {_END_YEAR}\n\n"
-        f"10 years · hourly · {tz_display}"
+        f"**ERA5 period:** {_START_YEAR}–{_END_YEAR}\n\n"
+        f"{n_years} years · hourly · {tz_display}"
     )
     st.divider()
-    st.header("Output Resolution")
+    st.markdown("### ⏱ Output Resolution")
     resolution = st.selectbox(
         "Temporal resolution",
-        options=["Hourly", "30-min", "10-min"],
+        options=["Hourly", "30-min (fake)", "10-min (fake)"],
         index=0,
         help=(
-            "30-min and 10-min outputs are stochastically disaggregated from "
-            "ERA5 hourly data using per-hour turbulence intensity (from ERA5 "
-            "gust factor) and an AR(1) process calibrated to the site's "
-            "mesoscale autocorrelation. Each run produces a plausible "
-            "realisation — not a historical record."
+            "Sub-hourly options are stochastically disaggregated from ERA5 hourly "
+            "data — they are NOT real measurements. Labelled '(fake)' as a reminder. "
+            "Each run produces one plausible realisation using per-hour turbulence "
+            "intensity and an AR(1) process calibrated to the site's autocorrelation."
         ),
     )
     st.divider()
-    run_btn = st.button("Fetch & Process Data", type="primary", use_container_width=True)
+    run_btn = st.button("🚀  Fetch & Process Data", type="primary", use_container_width=True)
 
-# Map + method description
+# ── Friendly display label (strips "(fake)" for headings) ────────────────────
+res_label = resolution.replace(" (fake)", "")
+
+# ── Map + method description ──────────────────────────────────────────────────
 col_map, col_method = st.columns([3, 2])
 
 with col_map:
-    st.subheader("Site Location")
+    st.markdown('<div class="section-header">Site Location</div>', unsafe_allow_html=True)
     m = folium.Map(location=[lat, lon], zoom_start=9, tiles=ESRI_TILES, attr=ESRI_ATTR)
 
-    # Input site (red)
     folium.Marker(
         [lat, lon],
         tooltip=f"Input site: {lat:.4f}°, {lon:.4f}°",
@@ -516,7 +650,6 @@ with col_map:
         icon=folium.Icon(color="red", icon="map-marker", prefix="fa"),
     ).add_to(m)
 
-    # ERA5 grid node (blue) — shown after first fetch
     if st.session_state["era5_node"]:
         elat, elon = st.session_state["era5_node"]
         folium.Marker(
@@ -532,7 +665,6 @@ with col_map:
                 tooltip="Site → ERA5 node",
             ).add_to(m)
 
-    # GWA grid node (orange) — shown after first fetch
     if st.session_state["gwa_node"]:
         glat, glon = st.session_state["gwa_node"]
         folium.Marker(
@@ -548,34 +680,63 @@ with col_map:
         st.caption("🔴 Input site  🔵 ERA5 grid node (~0.25°, ~28 km)  🟠 GWA grid node (250 m)")
 
 with col_method:
-    st.subheader("Processing Method")
-    st.markdown(
-        """
-        **① ERA5 @ 100 m**
-        10-year hourly wind speed from Open-Meteo ERA5 archive.
+    st.markdown('<div class="section-header">How the Synthesis Works</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="step-card">
+      <span class="step-num">1</span><strong>ERA5 @ 100 m</strong>
+      &nbsp;<span class="badge badge-era5">ERA5</span><br>
+      <span style="font-size:0.83rem;color:#475569;margin-left:30px;display:block;margin-top:4px;">
+        10-year hourly reanalysis via Open-Meteo (~28 km global grid). Provides realistic
+        temporal variability — weather events, seasons, and diurnal cycles.
+      </span>
+    </div>
+    <div class="step-card">
+      <span class="step-num">2</span><strong>Height extrapolation → 150 m</strong>
+      &nbsp;<span class="badge badge-era5">ERA5</span>
+      <span class="badge badge-gwa">GWA</span><br>
+      <span style="font-size:0.83rem;color:#475569;margin-left:30px;display:block;margin-top:4px;">
+        Power-law with a <em>diurnal</em> shear exponent α. The 24-hr shape is inferred
+        from ERA5 10m/100m ratio; the mean magnitude is calibrated to GWA's 100m/150m shear.
+      </span>
+    </div>
+    <div class="step-card">
+      <span class="step-num">3</span><strong>Weibull distribution correction</strong>
+      &nbsp;<span class="badge badge-synth">Synthesised</span><br>
+      <span style="font-size:0.83rem;color:#475569;margin-left:30px;display:block;margin-top:4px;">
+        Quantile transform morphs the ERA5 speed distribution to exactly match the GWA
+        150 m Weibull (A, k). Rank order — and all temporal patterns — are fully preserved.
+      </span>
+    </div>
+    """, unsafe_allow_html=True)
 
-        **② Height extrapolation 100 m → 150 m**
-        Power-law with a *diurnal shear exponent* — the 24-hour pattern of α
-        is inferred from the ERA5 10 m / 100 m ratio (captures the daily
-        stability cycle), then normalised so the long-term mean matches GWA's
-        100 m / 150 m shear:
+    with st.expander("Show equations"):
+        st.markdown(r"""
+**Height extrapolation:**
+$$V_{150}(t) = V_{100}(t) \times \left(\frac{150}{100}\right)^{\alpha(h)}$$
 
-        $$V_{150}(t) = V_{100}(t) \\times \\left(\\frac{150}{100}\\right)^{\\alpha(h)}$$
+**Weibull quantile transform:**
+$$V^* = A_{\text{GWA}} \times \left(\frac{V}{A_{\text{ERA5}}}\right)^{k_{\text{ERA5}} / k_{\text{GWA}}}$$
 
-        **③ Weibull distribution correction**
-        Quantile transform to match GWA 150 m Weibull *A* & *k*:
+*α(h) varies by hour of day — stronger at night (stable boundary layer), weaker by day (convective mixing).*
+        """)
 
-        $$V^* = A_{\\text{GWA}} \\times \\left(\\frac{V}{A_{\\text{ERA5}}}\\right)^{k_{\\text{ERA5}} / k_{\\text{GWA}}}$$
-
-        **Result:** ERA5 temporal structure + GWA spatial accuracy @ 150 m.
-        """
-    )
+    st.markdown("""
+    <div class="synth-note">
+    <strong>About the output:</strong> ERA5 contributes the temporal fingerprint —
+    every storm, lull, and seasonal pattern is drawn from real reanalysis. GWA
+    contributes spatial accuracy — its Weibull parameters encode terrain and
+    roughness effects resolved at 250 m. The Weibull quantile transform blends
+    both: ERA5's hour-by-hour sequence is preserved exactly, while the overall
+    speed distribution is morphed to match GWA's locally-calibrated statistics
+    at your exact site.
+    </div>
+    """, unsafe_allow_html=True)
 
 # ── Results section ───────────────────────────────────────────────────────────
 if run_btn:
     try:
         with st.spinner(f"Fetching {_END_YEAR - _START_YEAR + 1} years of ERA5 data…"):
-            df_era5_utc, era5_lat, era5_lon = fetch_era5(lat, lon)
+            df_era5_utc, era5_lat, era5_lon = fetch_era5(lat, lon, _START_YEAR, _END_YEAR)
 
         with st.spinner("Fetching Global Wind Atlas data…"):
             gwc, heights, gwa_lat, gwa_lon = fetch_gwa(lat, lon)
@@ -597,20 +758,19 @@ if run_btn:
         # ── Sub-hourly disaggregation ─────────────────────────────────────────
         df_sub = None
         sub_info = None
-        if resolution != "Hourly":
-            res_min = int(resolution.split("-")[0])
-            with st.spinner(f"Disaggregating to {resolution}…"):
+        if res_label != "Hourly":
+            res_min = int(res_label.split("-")[0])
+            with st.spinner(f"Disaggregating to {res_label}…"):
                 df_sub, sub_info = disaggregate_subhourly(df, res_min)
 
         n_records = len(df_sub) if df_sub is not None else len(df)
         st.success(
-            f"Done — {n_records:,} {resolution.lower()} records  "
+            f"Done — {n_records:,} {res_label.lower()} records  "
             f"({_START_YEAR}–{_END_YEAR} · {tz_label})"
         )
 
         # ── Summary metrics ───────────────────────────────────────────────────
-        st.divider()
-        st.subheader("Summary Statistics")
+        st.markdown('<div class="section-header">Summary Statistics</div>', unsafe_allow_html=True)
 
         c1, c2, c3 = st.columns(3)
         c1.metric(
@@ -633,6 +793,16 @@ if run_btn:
         c5.metric("GWA mean @ 150 m", f"{meta['mean_gwa_150']:.2f} m/s")
         c6.metric("Wind shear α (GWA mean)", f"{meta['alpha_mean']:.3f}")
 
+        st.markdown("""
+        <div class="synth-note">
+        <strong>How these numbers relate:</strong>
+        ERA5 raw 100 m is the original reanalysis value. Height extrapolation to 150 m
+        uses a diurnal power-law (ERA5 stability pattern + GWA-calibrated shear).
+        GWA-corrected 150 m is the final output — the Weibull quantile transform shifts
+        the distribution to match the GWA 150 m long-term statistics at your exact site.
+        </div>
+        """, unsafe_allow_html=True)
+
         with st.expander("Weibull Parameters"):
             wb_tbl = pd.DataFrame(
                 {
@@ -648,15 +818,36 @@ if run_btn:
                 }
             ).set_index("Parameter")
             st.dataframe(wb_tbl, use_container_width=True)
+            st.markdown("""
+            <div class="synth-note" style="margin-top:10px;">
+            The Weibull quantile transform maps each ERA5 150 m value to the equivalent
+            quantile in the GWA Weibull distribution — preserving the rank order (and
+            therefore all temporal patterns) while reshaping the speed distribution
+            to match GWA's locally-calibrated A and k.
+            </div>
+            """, unsafe_allow_html=True)
 
         # ── Sub-hourly disaggregation panel ──────────────────────────────────
         if df_sub is not None and sub_info is not None:
             st.divider()
-            st.subheader(f"Sub-hourly Disaggregation — {resolution}")
+            st.markdown(
+                f'<div class="section-header">Sub-hourly Disaggregation — {res_label}</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("""
+            <div class="warn-note">
+            <strong>⚠️ These values are not real measurements.</strong>
+            Sub-hourly wind speeds are stochastically generated from the ERA5 hourly
+            data using an AR(1) process. Each run produces one plausible realisation —
+            the temporal sequence within each hour is physically consistent but not
+            the actual historical record.
+            </div>
+            """, unsafe_allow_html=True)
 
             si = sub_info
             sb1, sb2, sb3, sb4 = st.columns(4)
-            sb1.metric("Output resolution", resolution)
+            sb1.metric("Output resolution", res_label)
             sb2.metric("Mean TI @ 150 m", f"{si['mean_TI_150']*100:.1f} %")
             sb3.metric("Mean σ_u @ 150 m", f"{si['mean_sigma']:.2f} m/s")
             sb4.metric("AR(1) φ per step", f"{si['phi_sub']:.3f}")
@@ -671,21 +862,18 @@ The per-hour σᵤ at 150 m is estimated from the ERA5 gust factor at 10 m:
 $$TI_{{10m}} = \\frac{{V_{{gust}}/V_{{10m}} - 1}}{{3.5}}, \\quad
   TI_{{150m}} = TI_{{10m}} \\times \\left(\\frac{{10}}{{150}}\\right)^{{0.11}}$$
 
-The standard deviation for {resolution} *mean* output is then reduced from
+The standard deviation for {res_label} *mean* output is then reduced from
 instantaneous TI using the ratio of the integral time scale (≈ 350 s at 150 m)
 to the averaging period ({si['resolution_min'] * 60} s):
 
-$$\\sigma_{{\\text{{{resolution}}}}} = TI_{{150m}} \\times V_{{150m}} \\times
+$$\\sigma_{{\\text{{{res_label}}}}} = TI_{{150m}} \\times V_{{150m}} \\times
   \\sqrt{{T_{{int}} / T_{{avg}}}} = \\times {si['spectral_factor']:.2f}\\; \\text{{of instantaneous}}$$
 
-A **continuous AR(1) process** is then generated at {resolution} timesteps across
+A **continuous AR(1) process** is then generated at {res_label} timesteps across
 the full 10-year record. The AR(1) coefficient (φ = {si['phi_sub']:.3f} per {si['resolution_min']}-min step)
 is derived from the hourly autocorrelation assuming a continuous-time
 Ornstein-Uhlenbeck process. Finally, each hourly block's noise is
 mean-corrected to exactly preserve the ERA5 hourly means.
-
-⚠️ **This is a single stochastic realisation.** The temporal sequence within each
-hour is plausible but not the actual historical record.
                     """
                 )
 
@@ -703,7 +891,7 @@ hour is plausible but not the actual historical record.
                     x=sample_sub.index,
                     y=sample_sub.values,
                     mode="lines",
-                    name=f"{resolution} (disaggregated)",
+                    name=f"{res_label} (stochastic — fake)",
                     line=dict(color="#27ae60", width=1.0),
                 )
             )
@@ -718,7 +906,7 @@ hour is plausible but not the actual historical record.
                 )
             )
             fig_sub.update_layout(
-                title=f"Sample {n_days}-day window showing {resolution} disaggregation",
+                title=f"Sample {n_days}-day window — {res_label} stochastic disaggregation (fake)",
                 xaxis_title=f"Date/Time ({tz_display})",
                 yaxis_title="Wind Speed @ 150 m (m/s)",
                 height=320,
@@ -728,8 +916,7 @@ hour is plausible but not the actual historical record.
             st.plotly_chart(fig_sub, use_container_width=True)
 
         # ── Diurnal shear profile ─────────────────────────────────────────────
-        st.divider()
-        st.subheader("Wind Shear Exponent α  (100 m → 150 m)")
+        st.markdown('<div class="section-header">Wind Shear Exponent α — 100 m → 150 m</div>', unsafe_allow_html=True)
 
         da = meta["diurnal_alpha"]
         alpha_min, alpha_max = float(da.min()), float(da.max())
@@ -798,10 +985,20 @@ diurnal signal.
             showlegend=False,
         )
         st.plotly_chart(fig_alpha, use_container_width=True)
+        st.markdown(f"""
+        <div class="synth-note">
+        <strong>Synthesis note — shear:</strong> The mean α ({meta['alpha_mean']:.3f}) is anchored
+        to GWA's 100m/150m mean wind speed ratio — GWA's high-resolution terrain model
+        determines the long-term average shear. The hour-by-hour variation is then drawn
+        from ERA5's 10m/100m ratio, which captures the real diurnal stability cycle
+        (stronger shear at night when the boundary layer is stable, weaker by day when
+        convection mixes the profile). This combined approach gives a physically consistent
+        diurnal α profile calibrated to GWA's spatial accuracy.
+        </div>
+        """, unsafe_allow_html=True)
 
         # ── Monthly mean time series ──────────────────────────────────────────
-        st.divider()
-        st.subheader("Monthly Mean Wind Speed")
+        st.markdown('<div class="section-header">Monthly Mean Wind Speed</div>', unsafe_allow_html=True)
 
         monthly = df.resample("ME").mean()[
             ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
@@ -832,9 +1029,18 @@ diurnal signal.
             legend=dict(orientation="h", y=-0.3),
         )
         st.plotly_chart(fig_monthly, use_container_width=True)
+        st.markdown("""
+        <div class="synth-note">
+        <strong>Synthesis note — time series:</strong> ERA5 raw 100 m is the original
+        reanalysis (real historical variability at ~28 km resolution). ERA5 extrap. 150 m
+        applies the diurnal power-law shear. GWA-corrected 150 m is the final synthesised
+        output — same temporal pattern as ERA5 but with the speed distribution matched to
+        GWA's locally-accurate Weibull at your site.
+        </div>
+        """, unsafe_allow_html=True)
 
         # ── Mean monthly seasonality ──────────────────────────────────────────
-        st.subheader("Mean Monthly Seasonality (all years averaged)")
+        st.markdown('<div class="section-header">Mean Monthly Seasonality (all years averaged)</div>', unsafe_allow_html=True)
         month_avg = df.copy()
         month_avg["month"] = month_avg.index.month
         seasonal = (
@@ -871,8 +1077,7 @@ diurnal signal.
         st.plotly_chart(fig_seasonal, use_container_width=True)
 
         # ── Weibull distribution ──────────────────────────────────────────────
-        st.divider()
-        st.subheader("Wind Speed Distribution @ 150 m")
+        st.markdown('<div class="section-header">Wind Speed Distribution @ 150 m</div>', unsafe_allow_html=True)
         st.caption(
             "Bars show empirical frequency; dashed line is the GWA Weibull target. "
             "The green bars should closely follow the dashed line."
@@ -927,10 +1132,18 @@ diurnal signal.
             legend=dict(orientation="h", y=-0.3),
         )
         st.plotly_chart(fig_wb, use_container_width=True)
+        st.markdown(f"""
+        <div class="synth-note">
+        <strong>Synthesis note — distribution:</strong> The blue bars show the ERA5-derived
+        150 m distribution before correction. The green bars show the final output after the
+        Weibull quantile transform — they should closely match the red dashed GWA target
+        (A = {meta['A_gwa_150']:.2f} m/s, k = {meta['k_gwa_150']:.2f}).
+        Any residual difference is a rounding effect from the discrete binning.
+        </div>
+        """, unsafe_allow_html=True)
 
         # ── Daily time series ─────────────────────────────────────────────────
-        st.divider()
-        st.subheader("Daily Mean Wind Speed — Full Record")
+        st.markdown('<div class="section-header">Daily Mean Wind Speed — Full Record</div>', unsafe_allow_html=True)
 
         daily = df.resample("D").mean()[["ws_100m", "ws_150m_corrected"]]
         daily.columns = ["ERA5 raw 100 m", "GWA-corrected 150 m"]
@@ -956,8 +1169,7 @@ diurnal signal.
         st.plotly_chart(fig_ts, use_container_width=True)
 
         # ── Download ──────────────────────────────────────────────────────────
-        st.divider()
-        st.subheader("Download")
+        st.markdown('<div class="section-header">Download</div>', unsafe_allow_html=True)
 
         if df_sub is not None:
             # Sub-hourly download
@@ -965,12 +1177,12 @@ diurnal signal.
             dl.index.name = f"datetime_{tz_display.replace('/', '_')}"
             dl.columns = ["gwa_corrected_150m_ms"]
             csv_bytes = dl.to_csv().encode()
-            dl_label = f"Download {resolution} time series (CSV)"
+            dl_label = f"Download {res_label} time series (CSV)"
             dl_caption = (
                 f"Column: GWA-corrected 150 m  |  m/s  |  "
-                f"{resolution} stochastic disaggregation  |  Timestamps: **{tz_display}**"
+                f"{res_label} stochastic disaggregation (fake)  |  Timestamps: **{tz_display}**"
             )
-            dl_fname = f"wind_150m_{resolution}_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
+            dl_fname = f"wind_150m_{res_label}_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
         else:
             # Hourly download (all columns)
             dl = df[["ws_100m", "ws_150m_raw", "ws_150m_corrected"]].copy()
