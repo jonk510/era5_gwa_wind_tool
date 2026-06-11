@@ -212,7 +212,7 @@ def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
             "longitude": lon,
             "start_date": f"{start_year}-01-01",
             "end_date": f"{end_year}-12-31",
-            "hourly": "wind_speed_100m,wind_speed_10m,wind_gusts_10m",
+            "hourly": "wind_speed_100m,wind_speed_10m,wind_gusts_10m,wind_direction_100m",
             "wind_speed_unit": "ms",
             "timezone": "UTC",
         },
@@ -227,6 +227,7 @@ def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
             "ws_100m": d["hourly"]["wind_speed_100m"],
             "ws_10m": d["hourly"]["wind_speed_10m"],
             "ws_gust_10m": d["hourly"]["wind_gusts_10m"],
+            "wd_100m": d["hourly"]["wind_direction_100m"],
         },
         index=pd.to_datetime(d["hourly"]["time"]),
     )
@@ -1428,32 +1429,47 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
         # ── Download ──────────────────────────────────────────────────────────
         st.markdown('<span class="lbl">Export</span><p class="sh">Download</p>', unsafe_allow_html=True)
 
+        # Helper: strip tz offset from index, keep it only in the column name
+        _tz_suffix = f"UTC{_tz_offset_str(df.index)}" if tz_display != "UTC" else "UTC"
+        def _prep_index(frame):
+            """Return a copy with a tz-naive index (offset encoded in column name)."""
+            out = frame.copy()
+            out.index = out.index.tz_localize(None)
+            out.index.name = f"datetime_{_tz_suffix}"
+            return out
+
         if df_sub is not None:
-            # Sub-hourly download
-            dl = df_sub.copy()
-            dl.index.name = f"datetime_{tz_display.replace('/', '_')}"
-            dl.columns = ["gwa_corrected_150m_ms"]
+            # Sub-hourly: wind speed only (direction not disaggregated)
+            dl = _prep_index(df_sub[["ws_150m_subhourly"]])
+            dl.columns = [f"gwa_corrected_150m_ms"]
+            dl = dl.round(1)
             csv_bytes = dl.to_csv().encode()
             dl_label = f"Download {res_label} time series (CSV)"
             dl_caption = (
-                f"Column: GWA-corrected 150 m  |  m/s  |  "
-                f"{res_label} stochastic disaggregation (fake)  |  Timestamps: **{tz_display}**"
+                f"gwa_corrected_150m_ms · m/s · 1 dp · "
+                f"{res_label} stochastic (fake) · Timestamps: {_tz_suffix}"
             )
             dl_fname = f"wind_150m_{res_label}_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
         else:
-            # Hourly download (all columns)
-            dl = df[["ws_100m", "ws_150m_raw", "ws_150m_corrected"]].copy()
-            dl.index.name = f"datetime_{tz_display.replace('/', '_')}"
+            # Hourly: speed columns + wind direction
+            dl = _prep_index(
+                df[["ws_100m", "ws_150m_raw", "ws_150m_corrected", "wd_100m"]]
+            )
             dl.columns = [
-                "era5_100m_ms",
-                "era5_150m_height_extrap_ms",
-                "gwa_corrected_150m_ms",
+                "era5_ws_100m_ms",
+                "era5_ws_150m_extrap_ms",
+                "gwa_corrected_ws_150m_ms",
+                "era5_wd_100m_deg",
             ]
+            # Round speeds to 1 dp; direction to nearest integer degree
+            dl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]] = (
+                dl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]].round(1)
+            )
+            dl["era5_wd_100m_deg"] = dl["era5_wd_100m_deg"].round(0).astype(int)
             csv_bytes = dl.to_csv().encode()
             dl_label = "Download hourly time series (CSV)"
             dl_caption = (
-                f"Columns: ERA5 100 m raw · ERA5 150 m (height extrap.) · "
-                f"GWA-corrected 150 m  |  All values in m/s  |  Timestamps: **{tz_display}**"
+                f"Speeds in m/s (1 dp) · Direction in ° (0–360) · Timestamps: {_tz_suffix}"
             )
             dl_fname = f"wind_150m_hourly_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
 
