@@ -631,13 +631,32 @@ st.markdown("""
     10-year hourly reanalysis &nbsp;·&nbsp; GWA spatial accuracy &nbsp;·&nbsp;
     <strong style="color:#0F172A;">150 m</strong> hub height
   </p>
+  <p style="font-size:0.85rem; color:#475569; margin:14px 0 0 0; line-height:1.65; max-width:780px;">
+    This tool synthesises a 10-year hourly wind speed time series at <strong>150 m hub height</strong>
+    for any location on Earth. It combines ERA5 reanalysis from
+    <a href="https://open-meteo.com" target="_blank" style="color:#4F46E5;">Open-Meteo</a>
+    — which provides realistic temporal variability (weather events, seasonal cycles, diurnal patterns)
+    at ~28 km resolution — with wind speed statistics from the
+    <a href="https://globalwindatlas.info" target="_blank" style="color:#4F46E5;">Global Wind Atlas</a>
+    (GWA), which captures local terrain and roughness effects at 250 m resolution.
+    A Weibull quantile transform is applied so the final time series matches GWA's
+    locally-calibrated speed distribution at your site, while preserving ERA5's
+    hour-by-hour temporal sequence exactly. Optionally, the hourly output can be
+    stochastically disaggregated to 30-min or 10-min intervals using a turbulence-aware
+    AR(1) process (note: sub-hourly output is synthetic, not a real measurement record).
+  </p>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Session state — persist grid node markers across re-renders ───────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 for _key in ("era5_node", "gwa_node", "_prev_lat", "_prev_lon"):
     if _key not in st.session_state:
         st.session_state[_key] = None
+# Default lat/lon for the WGS84 number inputs (updated by map clicks)
+if "lat_input" not in st.session_state:
+    st.session_state["lat_input"] = -31.9505
+if "lon_input" not in st.session_state:
+    st.session_state["lon_input"] = 115.8605
 
 # ── EPSG coordinate presets ───────────────────────────────────────────────────
 _EPSG_OPTIONS = {
@@ -688,13 +707,14 @@ with st.sidebar:
             lat, lon = -31.9505, 115.8605
     else:
         lat = st.number_input(
-            "Latitude", value=-31.9505, min_value=-90.0, max_value=90.0,
-            step=0.0001, format="%.4f",
+            "Latitude", min_value=-90.0, max_value=90.0,
+            step=0.0001, format="%.4f", key="lat_input",
         )
         lon = st.number_input(
-            "Longitude", value=115.8605, min_value=-180.0, max_value=180.0,
-            step=0.0001, format="%.4f",
+            "Longitude", min_value=-180.0, max_value=180.0,
+            step=0.0001, format="%.4f", key="lon_input",
         )
+        st.caption("Or click the map to set location.")
 
     if (st.session_state["_prev_lat"], st.session_state["_prev_lon"]) != (lat, lon):
         st.session_state["era5_node"] = None
@@ -804,12 +824,32 @@ with col_map:
             popup=f"<b>GWA grid node</b><br>{glat:.4f}°N, {glon:.4f}°E<br>250 m resolution",
         ).add_to(m)
 
-    st_folium(m, height=430, use_container_width=True, returned_objects=[], key="site_map")
+    _map_out = st_folium(
+        m, height=430, use_container_width=True,
+        returned_objects=["last_clicked"], key="site_map",
+    )
+
+    # Handle map clicks (WGS84 mode only)
+    if not is_projected and _map_out and _map_out.get("last_clicked"):
+        _click = _map_out["last_clicked"]
+        _clat = round(_click["lat"], 4)
+        _clng = round(_click["lng"], 4)
+        if (_clat, _clng) != (
+            round(st.session_state["lat_input"], 4),
+            round(st.session_state["lon_input"], 4),
+        ):
+            st.session_state["lat_input"] = _clat
+            st.session_state["lon_input"] = _clng
+            st.session_state["era5_node"] = None
+            st.session_state["gwa_node"] = None
+            st.rerun()
 
     if st.session_state["era5_node"] or st.session_state["gwa_node"]:
         st.caption("🔴 Input site  🔵 ERA5 grid node (~0.25°, ~28 km)  🟡 GWA grid node (250 m)")
+    elif is_projected:
+        st.caption("Click Fetch & Process Data to show ERA5 and GWA grid nodes.")
     else:
-        st.caption("Click Fetch & Process Data to show ERA5 and GWA grid nodes on the map.")
+        st.caption("Click the map to move the site · Fetch & Process Data to show grid nodes.")
 
 with col_method:
     st.markdown('<span class="lbl">Processing Pipeline</span><p class="sh">How the synthesis works</p>', unsafe_allow_html=True)
