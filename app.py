@@ -1327,6 +1327,64 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
             </div>
             """, unsafe_allow_html=True)
 
+        # ── Example day ───────────────────────────────────────────────────────
+        if df_sub is not None:
+            st.markdown(
+                f'<span class="lbl">Example Day</span>'
+                f'<p class="sh">ERA5 vs GWA-corrected vs {res_label} (fake) — Jan 1, {_START_YEAR}</p>',
+                unsafe_allow_html=True,
+            )
+
+            # First Jan 1 in the dataset
+            jan1 = pd.Timestamp(f"{_START_YEAR}-01-01", tz=df.index.tz)
+            jan1_end = pd.Timestamp(f"{_START_YEAR}-01-01 23:59", tz=df.index.tz)
+            day_h = df.loc[jan1:jan1_end]
+            day_sub = df_sub["ws_150m_subhourly"].loc[jan1:jan1_end]
+
+            fig_day = go.Figure()
+
+            # ERA5 raw 100 m — grey steps
+            fig_day.add_trace(go.Scatter(
+                x=day_h.index, y=day_h["ws_100m"],
+                mode="lines", name="ERA5 raw 100 m",
+                line=dict(color="#CBD5E1", width=2.0, shape="hv"),
+            ))
+            # GWA-corrected 150 m — indigo steps
+            fig_day.add_trace(go.Scatter(
+                x=day_h.index, y=day_h["ws_150m_corrected"],
+                mode="lines", name="GWA-corrected 150 m",
+                line=dict(color="#4F46E5", width=2.5, shape="hv"),
+            ))
+            # Sub-hourly fake — emerald continuous line
+            fig_day.add_trace(go.Scatter(
+                x=day_sub.index, y=day_sub.values,
+                mode="lines", name=f"{res_label} (fake)",
+                line=dict(color="#10B981", width=1.2),
+            ))
+
+            fig_day.update_layout(
+                template="plotly_white",
+                xaxis=dict(
+                    title=f"Time ({tz_display})",
+                    gridcolor="rgba(0,0,0,0.05)",
+                    tickformat="%H:%M",
+                ),
+                yaxis=dict(title="Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
+                height=340,
+                margin=dict(t=15, b=60, l=55, r=20),
+                legend=dict(orientation="h", y=-0.3),
+                font=dict(color="#64748B", size=11),
+            )
+            st.plotly_chart(fig_day, use_container_width=True)
+            st.markdown(f"""
+            <div class="ann">
+            Stepped lines show the hourly ERA5 values — constant within each hour.
+            The {res_label} green trace shows the stochastic variation generated
+            within each hour. The green line's block means exactly equal the indigo
+            GWA-corrected value for that hour.
+            </div>
+            """, unsafe_allow_html=True)
+
         # ── Download ──────────────────────────────────────────────────────────
         st.markdown('<span class="lbl">Export</span><p class="sh">Download</p>', unsafe_allow_html=True)
 
