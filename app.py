@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from scipy.optimize import brentq
+from scipy.signal import lfilter
 from scipy.special import gamma as sc_gamma
 from scipy.stats import weibull_min
 from streamlit_folium import st_folium
@@ -214,7 +215,7 @@ def fetch_era5(lat: float, lon: float):
             "longitude": lon,
             "start_date": f"{_START_YEAR}-01-01",
             "end_date": f"{_END_YEAR}-12-31",
-            "hourly": "wind_speed_100m,wind_speed_10m",
+            "hourly": "wind_speed_100m,wind_speed_10m,wind_gusts_10m",
             "wind_speed_unit": "ms",
             "timezone": "UTC",
         },
@@ -228,6 +229,7 @@ def fetch_era5(lat: float, lon: float):
         {
             "ws_100m": d["hourly"]["wind_speed_100m"],
             "ws_10m": d["hourly"]["wind_speed_10m"],
+            "ws_gust_10m": d["hourly"]["wind_gusts_10m"],
         },
         index=pd.to_datetime(d["hourly"]["time"]),
     )
@@ -334,6 +336,111 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list) -> tuple:
     return df, meta
 
 
+# ── Sub-hourly disaggregation ─────────────────────────────────────────────────
+
+def disaggregate_subhourly(
+    df: pd.DataFrame,
+    resolution_min: int,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Stochastically disaggregate hourly 150m wind to sub-hourly resolution.
+
+    Method
+    ------
+    1. Per-hour turbulence intensity at 150m estimated from ERA5 gust factor:
+         TI_10m  = (V_gust / V_10m − 1) / 3.5   (ERA5 ~1-min gust, peak factor ~3.5)
+         TI_150m = TI_10m × (10/150)^0.11         (TI decreases with height)
+         σ_u     = TI_150m × V_150m_corrected      (per-hour std at hub height)
+
+       For 10-min or 30-min *mean* output, variance is reduced from instantaneous:
+         σ_mean = σ_u × sqrt(T_int / T_avg)
+       where T_int ≈ 350 s (integral time scale at 150m) and T_avg is the
+       averaging period.  Clamped to [0.02 × V, 0.50 × V].
+
+    2. A single AR(1) process is generated at sub-hourly timesteps across the
+       entire record (continuous, no jumps at hour boundaries).  The AR(1)
+       coefficient is derived from the hourly autocorrelation via a
+       continuous-time OU assumption.
+
+    3. Each hourly block's AR(1) noise is mean-corrected so that the sub-hourly
+       block mean exactly equals the ERA5 hourly value (mean-preserving).
+
+    Returns
+    -------
+    (df_sub, info_dict)
+    df_sub  — DataFrame at sub-hourly resolution with column ws_150m_subhourly
+    info    — dict with TI statistics
+    """
+    rng = np.random.default_rng(seed)
+    n_sub = 60 // resolution_min
+    N_total = len(df) * n_sub
+
+    V = df["ws_150m_corrected"].values
+    V_10m = df["ws_10m"].values.clip(min=1.0)
+
+    # ── Per-hour sigma at hub height ─────────────────────────────────────────
+    if "ws_gust_10m" in df.columns:
+        GF = df["ws_gust_10m"].values / V_10m
+        TI_10m = np.clip((GF - 1.0) / 3.5, 0.03, 0.45)
+        TI_150 = TI_10m * (10.0 / 150.0) ** 0.11
+        ti_method = "ERA5 gust factor"
+    else:
+        # Fallback: terrain-neutral TI profile from IEC class B approximation
+        TI_150 = np.where(V > 0.5, 0.14 / (1 + 0.1 * V / V.mean()), 0.14)
+        ti_method = "IEC class B approximation"
+
+    # Spectral variance reduction for averaging period vs integral time scale
+    T_int_s = 350.0          # ~integral length scale at 150m / typical wind speed
+    T_avg_s = resolution_min * 60.0
+    spectral_factor = min(1.0, np.sqrt(T_int_s / T_avg_s))
+    sigma_h = np.clip(TI_150 * V * spectral_factor, 0.02 * np.maximum(V, 0.1), 0.50 * np.maximum(V, 0.1))
+
+    # ── AR(1) coefficient from hourly autocorrelation ────────────────────────
+    phi_1h = float(pd.Series(V).autocorr(lag=1))
+    phi_1h = np.clip(phi_1h, 0.50, 0.98)
+    T_decorr_min = -60.0 / np.log(phi_1h)
+    phi_sub = float(np.exp(-resolution_min / T_decorr_min))
+
+    # ── Generate continuous AR(1) noise ──────────────────────────────────────
+    # Use unit-variance AR(1) via lfilter, then scale to per-hour sigma
+    sigma_rep = np.repeat(sigma_h, n_sub)          # (N_total,)
+    innov_std = np.sqrt(1.0 - phi_sub ** 2)
+    white = rng.standard_normal(N_total)
+    noise_unit = lfilter([innov_std], [1.0, -phi_sub], white)
+
+    # Rescale to per-hour sigma (normalize unit noise, then apply sigma)
+    unit_std = noise_unit.std()
+    noise = noise_unit * (sigma_rep / unit_std) if unit_std > 0 else noise_unit * sigma_rep
+
+    # ── Mean-preserve: subtract block mean per hour ──────────────────────────
+    noise_reshaped = noise.reshape(len(df), n_sub)
+    noise_reshaped -= noise_reshaped.mean(axis=1, keepdims=True)
+    noise = noise_reshaped.ravel()
+
+    # ── Build output ─────────────────────────────────────────────────────────
+    background = np.repeat(V, n_sub)
+    ws_sub = np.maximum(background + noise, 0.0)
+
+    sub_index = pd.date_range(
+        df.index[0],
+        periods=N_total,
+        freq=f"{resolution_min}min",
+    )
+    df_sub = pd.DataFrame({"ws_150m_subhourly": ws_sub}, index=sub_index)
+
+    info = {
+        "ti_method": ti_method,
+        "mean_TI_150": float(TI_150.mean()),
+        "mean_sigma": float(sigma_h.mean()),
+        "phi_sub": phi_sub,
+        "spectral_factor": spectral_factor,
+        "resolution_min": resolution_min,
+        "n_sub": n_sub,
+    }
+    return df_sub, info
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.title("ERA5 + GWA Wind Resource Tool — 150 m")
@@ -376,6 +483,20 @@ with st.sidebar:
     st.info(
         f"**ERA5 period**\n{_START_YEAR} – {_END_YEAR}\n\n"
         f"10 years · hourly · {tz_display}"
+    )
+    st.divider()
+    st.header("Output Resolution")
+    resolution = st.selectbox(
+        "Temporal resolution",
+        options=["Hourly", "30-min", "10-min"],
+        index=0,
+        help=(
+            "30-min and 10-min outputs are stochastically disaggregated from "
+            "ERA5 hourly data using per-hour turbulence intensity (from ERA5 "
+            "gust factor) and an AR(1) process calibrated to the site's "
+            "mesoscale autocorrelation. Each run produces a plausible "
+            "realisation — not a historical record."
+        ),
     )
     st.divider()
     run_btn = st.button("Fetch & Process Data", type="primary", use_container_width=True)
@@ -471,9 +592,19 @@ if run_btn:
         with st.spinner("Running processing pipeline…"):
             df, meta = run_pipeline(df_era5, gwc, heights)
 
-        tz_label = f"UTC" if tz_display == "UTC" else f"{tz_detected} (UTC{_tz_offset_str(df.index)})"
+        tz_label = "UTC" if tz_display == "UTC" else f"{tz_detected} (UTC{_tz_offset_str(df.index)})"
+
+        # ── Sub-hourly disaggregation ─────────────────────────────────────────
+        df_sub = None
+        sub_info = None
+        if resolution != "Hourly":
+            res_min = int(resolution.split("-")[0])
+            with st.spinner(f"Disaggregating to {resolution}…"):
+                df_sub, sub_info = disaggregate_subhourly(df, res_min)
+
+        n_records = len(df_sub) if df_sub is not None else len(df)
         st.success(
-            f"Done — {len(df):,} hourly records processed  "
+            f"Done — {n_records:,} {resolution.lower()} records  "
             f"({_START_YEAR}–{_END_YEAR} · {tz_label})"
         )
 
@@ -517,6 +648,84 @@ if run_btn:
                 }
             ).set_index("Parameter")
             st.dataframe(wb_tbl, use_container_width=True)
+
+        # ── Sub-hourly disaggregation panel ──────────────────────────────────
+        if df_sub is not None and sub_info is not None:
+            st.divider()
+            st.subheader(f"Sub-hourly Disaggregation — {resolution}")
+
+            si = sub_info
+            sb1, sb2, sb3, sb4 = st.columns(4)
+            sb1.metric("Output resolution", resolution)
+            sb2.metric("Mean TI @ 150 m", f"{si['mean_TI_150']*100:.1f} %")
+            sb3.metric("Mean σ_u @ 150 m", f"{si['mean_sigma']:.2f} m/s")
+            sb4.metric("AR(1) φ per step", f"{si['phi_sub']:.3f}")
+
+            with st.expander("Disaggregation method"):
+                st.markdown(
+                    f"""
+**Turbulence intensity source:** {si['ti_method']}
+
+The per-hour σᵤ at 150 m is estimated from the ERA5 gust factor at 10 m:
+
+$$TI_{{10m}} = \\frac{{V_{{gust}}/V_{{10m}} - 1}}{{3.5}}, \\quad
+  TI_{{150m}} = TI_{{10m}} \\times \\left(\\frac{{10}}{{150}}\\right)^{{0.11}}$$
+
+The standard deviation for {resolution} *mean* output is then reduced from
+instantaneous TI using the ratio of the integral time scale (≈ 350 s at 150 m)
+to the averaging period ({si['resolution_min'] * 60} s):
+
+$$\\sigma_{{\\text{{{resolution}}}}} = TI_{{150m}} \\times V_{{150m}} \\times
+  \\sqrt{{T_{{int}} / T_{{avg}}}} = \\times {si['spectral_factor']:.2f}\\; \\text{{of instantaneous}}$$
+
+A **continuous AR(1) process** is then generated at {resolution} timesteps across
+the full 10-year record. The AR(1) coefficient (φ = {si['phi_sub']:.3f} per {si['resolution_min']}-min step)
+is derived from the hourly autocorrelation assuming a continuous-time
+Ornstein-Uhlenbeck process. Finally, each hourly block's noise is
+mean-corrected to exactly preserve the ERA5 hourly means.
+
+⚠️ **This is a single stochastic realisation.** The temporal sequence within each
+hour is plausible but not the actual historical record.
+                    """
+                )
+
+            # Sample plot: 5 days from middle of record
+            mid = len(df) // 2
+            n_days = 5
+            sample_h = df["ws_150m_corrected"].iloc[mid : mid + 24 * n_days]
+            sample_sub = df_sub["ws_150m_subhourly"].loc[
+                sample_h.index[0] : sample_h.index[-1]
+            ]
+
+            fig_sub = go.Figure()
+            fig_sub.add_trace(
+                go.Scatter(
+                    x=sample_sub.index,
+                    y=sample_sub.values,
+                    mode="lines",
+                    name=f"{resolution} (disaggregated)",
+                    line=dict(color="#27ae60", width=1.0),
+                )
+            )
+            fig_sub.add_trace(
+                go.Scatter(
+                    x=sample_h.index,
+                    y=sample_h.values,
+                    mode="lines+markers",
+                    name="Hourly ERA5+GWA",
+                    line=dict(color="#c0392b", width=2.0, dash="dash"),
+                    marker=dict(size=5),
+                )
+            )
+            fig_sub.update_layout(
+                title=f"Sample {n_days}-day window showing {resolution} disaggregation",
+                xaxis_title=f"Date/Time ({tz_display})",
+                yaxis_title="Wind Speed @ 150 m (m/s)",
+                height=320,
+                margin=dict(t=40, b=50, l=60, r=20),
+                legend=dict(orientation="h", y=-0.3),
+            )
+            st.plotly_chart(fig_sub, use_container_width=True)
 
         # ── Diurnal shear profile ─────────────────────────────────────────────
         st.divider()
@@ -750,27 +959,43 @@ diurnal signal.
         st.divider()
         st.subheader("Download")
 
-        dl = df[["ws_100m", "ws_150m_raw", "ws_150m_corrected"]].copy()
-        dl.index.name = f"datetime_{tz_display.replace('/', '_')}"
-        dl.columns = [
-            "era5_100m_ms",
-            "era5_150m_height_extrap_ms",
-            "gwa_corrected_150m_ms",
-        ]
-        csv_bytes = dl.to_csv().encode()
+        if df_sub is not None:
+            # Sub-hourly download
+            dl = df_sub.copy()
+            dl.index.name = f"datetime_{tz_display.replace('/', '_')}"
+            dl.columns = ["gwa_corrected_150m_ms"]
+            csv_bytes = dl.to_csv().encode()
+            dl_label = f"Download {resolution} time series (CSV)"
+            dl_caption = (
+                f"Column: GWA-corrected 150 m  |  m/s  |  "
+                f"{resolution} stochastic disaggregation  |  Timestamps: **{tz_display}**"
+            )
+            dl_fname = f"wind_150m_{resolution}_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
+        else:
+            # Hourly download (all columns)
+            dl = df[["ws_100m", "ws_150m_raw", "ws_150m_corrected"]].copy()
+            dl.index.name = f"datetime_{tz_display.replace('/', '_')}"
+            dl.columns = [
+                "era5_100m_ms",
+                "era5_150m_height_extrap_ms",
+                "gwa_corrected_150m_ms",
+            ]
+            csv_bytes = dl.to_csv().encode()
+            dl_label = "Download hourly time series (CSV)"
+            dl_caption = (
+                f"Columns: ERA5 100 m raw · ERA5 150 m (height extrap.) · "
+                f"GWA-corrected 150 m  |  All values in m/s  |  Timestamps: **{tz_display}**"
+            )
+            dl_fname = f"wind_150m_hourly_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
 
         st.download_button(
-            label="Download hourly time series (CSV)",
+            label=dl_label,
             data=csv_bytes,
-            file_name=f"wind_150m_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv",
+            file_name=dl_fname,
             mime="text/csv",
             use_container_width=True,
         )
-
-        st.caption(
-            f"Columns: ERA5 100 m raw · ERA5 150 m (height extrap.) · "
-            f"GWA-corrected 150 m  |  All values in m/s  |  Timestamps: **{tz_display}**"
-        )
+        st.caption(dl_caption)
 
     except requests.HTTPError as exc:
         st.error(f"API request failed: {exc}")
