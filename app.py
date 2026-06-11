@@ -459,6 +459,7 @@ st.markdown("""
 <style>
 /* ── Global ─────────────────────────────────────────────── */
 html, body, [class*="css"] {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
     -webkit-font-smoothing: antialiased;
 }
 .main .block-container {
