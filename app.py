@@ -73,10 +73,7 @@ ESRI_TILES = (
     "https://server.arcgisonline.com/ArcGIS/rest/services/"
     "World_Imagery/MapServer/tile/{z}/{y}/{x}"
 )
-ESRI_ATTR = (
-    "Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, "
-    "Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
-)
+ESRI_ATTR = "&copy; <a href='https://www.esri.com'>Esri</a>"
 
 
 # ── GWC parser ────────────────────────────────────────────────────────────────
@@ -758,41 +755,60 @@ with col_map:
     st.markdown('<span class="lbl">Site Location</span>', unsafe_allow_html=True)
     m = folium.Map(location=[lat, lon], zoom_start=9, tiles=ESRI_TILES, attr=ESRI_ATTR)
 
-    folium.Marker(
+    # Input site — red filled circle with white border
+    folium.CircleMarker(
         [lat, lon],
-        tooltip=f"Input site: {lat:.4f}°, {lon:.4f}°",
+        radius=9,
+        color="white",
+        weight=2,
+        fill=True,
+        fill_color="#EF4444",
+        fill_opacity=1.0,
+        tooltip=f"Input site: {lat:.4f}°N, {lon:.4f}°E",
         popup=f"<b>Input site</b><br>{lat:.4f}°N, {lon:.4f}°E",
-        icon=folium.Icon(color="red", icon="map-marker", prefix="fa"),
     ).add_to(m)
 
     if st.session_state["era5_node"]:
         elat, elon = st.session_state["era5_node"]
-        folium.Marker(
+        folium.CircleMarker(
             [elat, elon],
-            tooltip=f"ERA5 node (~0.25° grid): {elat:.4f}°, {elon:.4f}°",
-            popup=f"<b>ERA5 grid node</b><br>{elat:.4f}°N, {elon:.4f}°E<br>Resolution ~28 km",
-            icon=folium.Icon(color="blue", icon="cloud", prefix="fa"),
+            radius=8,
+            color="white",
+            weight=2,
+            fill=True,
+            fill_color="#3B82F6",
+            fill_opacity=1.0,
+            tooltip=f"ERA5 grid node (~0.25°): {elat:.4f}°N, {elon:.4f}°E",
+            popup=f"<b>ERA5 grid node</b><br>{elat:.4f}°N, {elon:.4f}°E<br>~28 km resolution",
         ).add_to(m)
         if (elat, elon) != (lat, lon):
             folium.PolyLine(
                 [[lat, lon], [elat, elon]],
-                color="#4a90d9", weight=1.5, dash_array="6",
+                color="white", weight=1.5, dash_array="5",
+                opacity=0.7,
                 tooltip="Site → ERA5 node",
             ).add_to(m)
 
     if st.session_state["gwa_node"]:
         glat, glon = st.session_state["gwa_node"]
-        folium.Marker(
+        folium.CircleMarker(
             [glat, glon],
-            tooltip=f"GWA node (250 m grid): {glat:.4f}°, {glon:.4f}°",
-            popup=f"<b>GWA grid node</b><br>{glat:.4f}°N, {glon:.4f}°E<br>Resolution 250 m",
-            icon=folium.Icon(color="orange", icon="sun-o", prefix="fa"),
+            radius=8,
+            color="white",
+            weight=2,
+            fill=True,
+            fill_color="#F59E0B",
+            fill_opacity=1.0,
+            tooltip=f"GWA grid node (250 m): {glat:.4f}°N, {glon:.4f}°E",
+            popup=f"<b>GWA grid node</b><br>{glat:.4f}°N, {glon:.4f}°E<br>250 m resolution",
         ).add_to(m)
 
-    st_folium(m, height=420, use_container_width=True, returned_objects=[])
+    st_folium(m, height=430, use_container_width=True, returned_objects=[], key="site_map")
 
     if st.session_state["era5_node"] or st.session_state["gwa_node"]:
-        st.caption("🔴 Input site  🔵 ERA5 grid node (~0.25°, ~28 km)  🟠 GWA grid node (250 m)")
+        st.caption("🔴 Input site  🔵 ERA5 grid node (~0.25°, ~28 km)  🟡 GWA grid node (250 m)")
+    else:
+        st.caption("Click Fetch & Process Data to show ERA5 and GWA grid nodes on the map.")
 
 with col_method:
     st.markdown('<span class="lbl">Processing Pipeline</span><p class="sh">How the synthesis works</p>', unsafe_allow_html=True)
