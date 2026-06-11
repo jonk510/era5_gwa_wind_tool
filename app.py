@@ -1438,34 +1438,38 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
             out.index.name = f"datetime_{_tz_suffix}"
             return out
 
+        _has_wd = "wd_100m" in df.columns
+
         if df_sub is not None:
-            # Sub-hourly: wind speed only (direction not disaggregated)
-            dl = _prep_index(df_sub[["ws_150m_subhourly"]])
-            dl.columns = [f"gwa_corrected_150m_ms"]
-            dl = dl.round(1)
+            # Sub-hourly speed + hourly direction repeated for each sub-hourly step
+            dl = _prep_index(df_sub[["ws_150m_subhourly"]].copy())
+            dl.columns = ["gwa_corrected_ws_150m_ms"]
+            dl["gwa_corrected_ws_150m_ms"] = dl["gwa_corrected_ws_150m_ms"].round(1)
+            if _has_wd:
+                # Forward-fill hourly direction to sub-hourly timestamps
+                wd_sub = df["wd_100m"].reindex(df_sub.index, method="ffill")
+                dl["era5_wd_100m_deg"] = wd_sub.round(0).astype(int).values
             csv_bytes = dl.to_csv().encode()
             dl_label = f"Download {res_label} time series (CSV)"
             dl_caption = (
-                f"gwa_corrected_150m_ms · m/s · 1 dp · "
-                f"{res_label} stochastic (fake) · Timestamps: {_tz_suffix}"
+                f"ws: GWA-corrected 150 m (m/s, 1 dp, {res_label} stochastic fake) · "
+                f"wd: ERA5 100 m (°, hourly repeated) · Timestamps: {_tz_suffix}"
             )
             dl_fname = f"wind_150m_{res_label}_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
         else:
             # Hourly: speed columns + wind direction
-            dl = _prep_index(
-                df[["ws_100m", "ws_150m_raw", "ws_150m_corrected", "wd_100m"]]
-            )
-            dl.columns = [
-                "era5_ws_100m_ms",
-                "era5_ws_150m_extrap_ms",
-                "gwa_corrected_ws_150m_ms",
-                "era5_wd_100m_deg",
-            ]
-            # Round speeds to 1 dp; direction to nearest integer degree
+            cols = ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
+            col_names = ["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]
+            if _has_wd:
+                cols.append("wd_100m")
+                col_names.append("era5_wd_100m_deg")
+            dl = _prep_index(df[cols])
+            dl.columns = col_names
             dl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]] = (
                 dl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]].round(1)
             )
-            dl["era5_wd_100m_deg"] = dl["era5_wd_100m_deg"].round(0).astype(int)
+            if _has_wd:
+                dl["era5_wd_100m_deg"] = dl["era5_wd_100m_deg"].round(0).astype(int)
             csv_bytes = dl.to_csv().encode()
             dl_label = "Download hourly time series (CSV)"
             dl_caption = (
