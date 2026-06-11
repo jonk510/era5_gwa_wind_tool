@@ -1432,13 +1432,35 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
         # Helper: strip tz offset from index, keep it only in the column name
         _tz_suffix = f"UTC{_tz_offset_str(df.index)}" if tz_display != "UTC" else "UTC"
         def _prep_index(frame):
-            """Return a copy with a tz-naive index (offset encoded in column name)."""
             out = frame.copy()
             out.index = out.index.tz_localize(None)
             out.index.name = f"datetime_{_tz_suffix}"
             return out
 
         _has_wd = "wd_100m" in df.columns
+
+        # Build metadata header lines (# prefix so parsers can skip easily)
+        _era5_node = st.session_state.get("era5_node")
+        _gwa_node  = st.session_state.get("gwa_node")
+        _header_lines = [
+            "# ERA5 x GWA Wind Resource Synthesis — synthesised time series",
+            "#",
+            f"# Site (input):       {lat:.4f}N, {lon:.4f}E",
+            (f"# ERA5 grid node:     {_era5_node[0]:.4f}N, {_era5_node[1]:.4f}E  (~0.25 deg grid, ~28 km)"
+             if _era5_node else "# ERA5 grid node:     unknown (fetch data to populate)"),
+            (f"# GWA grid node:      {_gwa_node[0]:.4f}N, {_gwa_node[1]:.4f}E  (250 m grid)"
+             if _gwa_node else "# GWA grid node:      unknown (fetch data to populate)"),
+            f"# Timezone:           {tz_display} ({_tz_suffix})",
+            f"# Period:             {_START_YEAR}-01-01 to {_END_YEAR}-12-31",
+            "#",
+            "# DATA SOURCE:        SYNTHESISED — NOT A MEASUREMENT RECORD",
+            "# Wind speeds are derived by combining ERA5 reanalysis (temporal variability)",
+            "# with Global Wind Atlas statistics (spatial accuracy via Weibull correction).",
+            "# Sub-hourly values (if present) are stochastic disaggregations, not observations.",
+            "# Results are indicative only. Do not use as a substitute for on-site measurement.",
+            "#",
+        ]
+        _file_header = "\n".join(_header_lines) + "\n"
 
         if df_sub is not None:
             # Sub-hourly speed + hourly direction repeated for each sub-hourly step
@@ -1449,7 +1471,7 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
                 # Forward-fill hourly direction to sub-hourly timestamps
                 wd_sub = df["wd_100m"].reindex(df_sub.index, method="ffill")
                 dl["era5_wd_100m_deg"] = wd_sub.round(0).astype(int).values
-            csv_bytes = dl.to_csv().encode()
+            csv_bytes = (_file_header + dl.to_csv()).encode()
             dl_label = f"Download {res_label} time series (CSV)"
             dl_caption = (
                 f"ws: GWA-corrected 150 m (m/s, 1 dp, {res_label} stochastic fake) · "
@@ -1470,7 +1492,7 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
             )
             if _has_wd:
                 dl["era5_wd_100m_deg"] = dl["era5_wd_100m_deg"].round(0).astype(int)
-            csv_bytes = dl.to_csv().encode()
+            csv_bytes = (_file_header + dl.to_csv()).encode()
             dl_label = "Download hourly time series (CSV)"
             dl_caption = (
                 f"Speeds in m/s (1 dp) · Direction in ° (0–360) · Timestamps: {_tz_suffix}"
