@@ -993,6 +993,10 @@ $$V^* = A_{\text{GWA}} \times \left(\frac{V}{A_{\text{ERA5}}}\right)^{k_{\text{E
     terrain and roughness at 250 m resolution. The quantile transform fuses both: ERA5's
     hour-by-hour sequence is preserved, the speed distribution is matched to GWA's
     site-specific statistics.
+    <br><br>
+    <strong>Onshore use only.</strong> This tool is designed for land-based sites.
+    Offshore or open-ocean locations are not supported — roughness class selection
+    assumes land terrain and wind speeds at sea sites will be underestimated.
     </div>
     """, unsafe_allow_html=True)
 
