@@ -711,31 +711,35 @@ html, body, [class*="css"] {
 
 # ── Page header ───────────────────────────────────────────────────────────────
 st.markdown("""
-<div style="padding-bottom:1.5rem; margin-bottom:0.5rem; border-bottom:1px solid #E2E8F0;">
+<div style="padding-bottom:1.25rem; margin-bottom:0.5rem; border-bottom:1px solid #E2E8F0;">
   <p style="font-size:0.7rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase;
             color:#94A3B8; margin:0 0 6px 0;">Wind Resource Tool</p>
   <h1 style="font-size:1.7rem; font-weight:700; color:#0F172A; margin:0; letter-spacing:-0.03em;
              line-height:1.15;">ERA5 × Global Wind Atlas</h1>
   <p style="font-size:0.9rem; color:#64748B; margin:6px 0 0 0; line-height:1.4;">
     10-year hourly reanalysis &nbsp;·&nbsp; GWA spatial accuracy &nbsp;·&nbsp;
-    <strong style="color:#0F172A;">150 m</strong> hub height
-  </p>
-  <p style="font-size:0.85rem; color:#475569; margin:14px 0 0 0; line-height:1.65; max-width:780px;">
-    This tool synthesises a 10-year hourly wind speed time series at <strong>150 m hub height</strong>
-    for any location on Earth. It combines ERA5 reanalysis from
-    <a href="https://open-meteo.com" target="_blank" style="color:#4F46E5;">Open-Meteo</a>
-    — which provides realistic temporal variability (weather events, seasonal cycles, diurnal patterns)
-    at ~28 km resolution — with wind speed statistics from the
-    <a href="https://globalwindatlas.info" target="_blank" style="color:#4F46E5;">Global Wind Atlas</a>
-    (GWA), which captures local terrain and roughness effects at 250 m resolution.
-    A Weibull quantile transform is applied so the final time series matches GWA's
-    locally-calibrated speed distribution at your site, while preserving ERA5's
-    hour-by-hour temporal sequence exactly. Optionally, the hourly output can be
-    stochastically disaggregated to 30-min or 10-min intervals using a turbulence-aware
-    AR(1) process (note: sub-hourly output is synthetic, not a real measurement record).
+    <strong style="color:#0F172A;">150 m</strong> hub height &nbsp;·&nbsp; onshore
   </p>
 </div>
 """, unsafe_allow_html=True)
+
+with st.expander("About this tool"):
+    st.markdown("""
+This tool synthesises a long-term hourly wind speed time series at **150 m hub height**
+for any onshore location. It combines two complementary data sources:
+
+- **[ERA5](https://open-meteo.com)** reanalysis (~28 km grid) — provides realistic
+  temporal variability: storms, seasonal cycles, diurnal patterns.
+- **[Global Wind Atlas](https://globalwindatlas.info)** (250 m grid) — provides local
+  spatial accuracy, encoding terrain and roughness effects through Weibull statistics.
+
+A Weibull quantile transform is applied so the final time series matches GWA's
+locally-calibrated speed distribution, while preserving ERA5's hour-by-hour sequence.
+Sub-hourly output (30-min / 10-min) is stochastically disaggregated via AR(1) and is
+synthetic — not a real measurement record.
+
+> **Onshore use only.** Offshore or open-ocean sites are not supported.
+    """)
 
 # ── Session state ─────────────────────────────────────────────────────────────
 for _key in ("era5_node", "gwa_node", "_prev_lat", "_prev_lon"):
@@ -985,20 +989,6 @@ $$V^* = A_{\text{GWA}} \times \left(\frac{V}{A_{\text{ERA5}}}\right)^{k_{\text{E
 
 *α(h) varies by hour — stronger at night (stable BL), weaker by day (convective mixing).*
         """)
-
-    st.markdown("""
-    <div class="ann" style="margin-top:1rem;">
-    <strong>What you get:</strong> ERA5 provides the temporal fingerprint — every storm and season
-    drawn from real reanalysis. GWA provides spatial accuracy — Weibull parameters that encode
-    terrain and roughness at 250 m resolution. The quantile transform fuses both: ERA5's
-    hour-by-hour sequence is preserved, the speed distribution is matched to GWA's
-    site-specific statistics.
-    <br><br>
-    <strong>Onshore use only.</strong> This tool is designed for land-based sites.
-    Offshore or open-ocean locations are not supported — roughness class selection
-    assumes land terrain and wind speeds at sea sites will be underestimated.
-    </div>
-    """, unsafe_allow_html=True)
 
 # ── Results section ───────────────────────────────────────────────────────────
 if run_btn:
