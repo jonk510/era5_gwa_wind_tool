@@ -717,7 +717,7 @@ st.markdown("""
   <h1 style="font-size:1.7rem; font-weight:700; color:#0F172A; margin:0; letter-spacing:-0.03em;
              line-height:1.15;">ERA5 × Global Wind Atlas</h1>
   <p style="font-size:0.9rem; color:#64748B; margin:6px 0 0 0; line-height:1.4;">
-    10-year hourly reanalysis &nbsp;·&nbsp; GWA spatial accuracy &nbsp;·&nbsp;
+    ERA5 hourly reanalysis &nbsp;·&nbsp; GWA spatial accuracy &nbsp;·&nbsp;
     <strong style="color:#0F172A;">150 m</strong> hub height &nbsp;·&nbsp; onshore
   </p>
 </div>
