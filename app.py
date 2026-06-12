@@ -161,7 +161,15 @@ def parse_gwc(text):
     rough_vals = list(map(float, lines[1].split()))[:n_rough]
     height_vals = list(map(float, lines[2].split()))[:n_heights]
 
-    gwc = {}
+    # Collect all roughness classes first, then select the most appropriate one.
+    # r=0.0 (sea) gives the theoretical free-stream resource and inflates land
+    # site wind speeds by 20–30%.  We default to r≈0.1 m (farmland with
+    # scattered obstacles), the closest standard roughness class to typical
+    # onshore wind energy terrain.  If only r=0.0 is available (offshore),
+    # it is used as-is.
+    _LAND_REF_ROUGHNESS = 0.1  # m — open farmland with obstacles
+
+    all_data = {}   # (roughness, height) → {A, k, mean}
     idx = 3
 
     for ri in range(n_rough):
@@ -185,10 +193,23 @@ def parse_gwc(text):
             h = height_vals[hi]
             r = rough_vals[ri] if ri < len(rough_vals) else 999
             A_c, k_c, mean_ws = _combined_weibull(f_arr, A_arr, k_arr)
+            all_data[(r, h)] = {"A": A_c, "k": k_c, "mean": mean_ws}
 
-            # Keep the entry with the lowest roughness (free-stream resource)
-            if h not in gwc or r < gwc[h]["roughness"]:
-                gwc[h] = {"A": A_c, "k": k_c, "mean": mean_ws, "roughness": r}
+    if not all_data:
+        raise ValueError("Could not extract any height data from GWC file.")
+
+    available_roughnesses = sorted({r for r, _ in all_data})
+    land_roughnesses = [r for r in available_roughnesses if r > 0.001]
+    selected_r = (
+        min(land_roughnesses, key=lambda rv: abs(rv - _LAND_REF_ROUGHNESS))
+        if land_roughnesses else available_roughnesses[0]
+    )
+
+    gwc = {
+        h: dict(vals, roughness=selected_r)
+        for (r, h), vals in all_data.items()
+        if r == selected_r
+    }
 
     if not gwc:
         raise ValueError("Could not extract any height data from GWC file.")
@@ -344,6 +365,7 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list) -> tuple:
         "k_era5_150": k_era5_150,
         "A_gwa_150": A_gwa_150,
         "k_gwa_150": k_gwa_150,
+        "gwa_roughness_used": g150.get("roughness"),
     }
 
     return df, meta
@@ -974,11 +996,18 @@ if run_btn:
             delta_color="off",
         )
 
-        st.markdown("""
+        _rough_used = meta.get("gwa_roughness_used")
+        _rough_note = (
+            f" GWA values are derived from roughness class <strong>r = {_rough_used:.3f} m</strong> "
+            f"(closest standard class to 0.1 m open land). Values on the GWA website "
+            f"may differ slightly due to terrain and local roughness effects."
+            if _rough_used is not None else ""
+        )
+        st.markdown(f"""
         <div class="ann">
         <strong>Reading these numbers:</strong> ERA5 raw 100 m is the original reanalysis.
         ERA5 extrap. 150 m applies the diurnal power-law shear. GWA-corrected 150 m is the
-        final synthesised output — Weibull-transformed to match GWA's site statistics.
+        final synthesised output — Weibull-transformed to match GWA's site statistics.{_rough_note}
         </div>
         """, unsafe_allow_html=True)
 
