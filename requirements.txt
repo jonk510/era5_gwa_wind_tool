@@ -8,3 +8,4 @@ folium>=0.17
 streamlit-folium>=0.21
 timezonefinder>=6.5
 pyproj>=3.6
+openpyxl>=3.1

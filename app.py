@@ -13,6 +13,7 @@ Pipeline:
 import re
 import warnings
 from datetime import datetime
+from pathlib import Path
 
 import folium
 import numpy as np
@@ -21,6 +22,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from pyproj import Transformer
+from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import brentq
 from scipy.signal import lfilter
 from scipy.special import gamma as sc_gamma
@@ -337,6 +339,91 @@ def fetch_site_roughness(lat: float, lon: float) -> tuple[float, str]:
         return _fallback
 
 
+# ── AEP helpers ───────────────────────────────────────────────────────────────
+
+_DATA_DIR = Path(__file__).parent / "data"
+
+
+@st.cache_data(show_spinner=False)
+def load_power_curves() -> pd.DataFrame | None:
+    """Load data/power_curves.xlsx. Returns DataFrame[WTG → kW] indexed by wind speed (m/s)."""
+    p = _DATA_DIR / "power_curves.xlsx"
+    if not p.exists():
+        return None
+    df = pd.read_excel(p, index_col=0, header=0)
+    df.index = df.index.astype(float)
+    return df.sort_index()
+
+
+@st.cache_data(show_spinner=False)
+def load_wake_matrix() -> pd.DataFrame | None:
+    """Load data/wake_loss_matrix.xlsx. Returns DataFrame[nameplate_MW → %] indexed by wind speed (m/s)."""
+    p = _DATA_DIR / "wake_loss_matrix.xlsx"
+    if not p.exists():
+        return None
+    df = pd.read_excel(p, index_col=0, header=0)
+    df.index = df.index.astype(float)
+    df.columns = df.columns.astype(float)
+    return df.sort_index().sort_index(axis=1)
+
+
+def calc_aep(
+    ws: pd.Series,
+    pc_df: pd.DataFrame,
+    wtg: str,
+    nameplate_mw: float,
+    wake_df: pd.DataFrame | None,
+) -> dict:
+    """Apply power curve + optional wake losses to an hourly wind speed series; return AEP stats."""
+    ws_arr = pc_df.index.values.astype(float)
+    kw_arr = pc_df[wtg].values.astype(float)
+    rated_kw = float(kw_arr.max())
+
+    ws_vals = ws.values
+    gross_kw = np.interp(ws_vals, ws_arr, kw_arr, left=0.0, right=rated_kw)
+    gross_mw = gross_kw / rated_kw * nameplate_mw
+
+    if wake_df is not None:
+        ws_bins = wake_df.index.values.astype(float)
+        cap_bins = wake_df.columns.values.astype(float)
+        interp_fn = RegularGridInterpolator(
+            (ws_bins, cap_bins),
+            wake_df.values.astype(float),
+            method="linear",
+            bounds_error=False,
+            fill_value=None,
+        )
+        pts = np.column_stack([
+            np.clip(ws_vals, ws_bins.min(), ws_bins.max()),
+            np.full(len(ws_vals), float(np.clip(nameplate_mw, cap_bins.min(), cap_bins.max()))),
+        ])
+        wake_pct = interp_fn(pts).clip(0.0, 100.0)
+        net_mw = gross_mw * (1.0 - wake_pct / 100.0)
+        producing = gross_mw > 0
+        mean_wake = float(wake_pct[producing].mean()) if producing.any() else 0.0
+    else:
+        net_mw = gross_mw.copy()
+        wake_pct = np.zeros_like(gross_mw)
+        mean_wake = 0.0
+
+    n_years = len(ws) / 8760.0
+    gross_aep = float(gross_mw.sum()) / n_years   # MWh/yr
+    net_aep = float(net_mw.sum()) / n_years        # MWh/yr
+    cf = net_aep / (nameplate_mw * 8760.0)
+
+    return {
+        "gross_mw_ts": pd.Series(gross_mw, index=ws.index),
+        "net_mw_ts": pd.Series(net_mw, index=ws.index),
+        "wake_pct_ts": pd.Series(wake_pct, index=ws.index),
+        "gross_aep_mwh": gross_aep,
+        "net_aep_mwh": net_aep,
+        "mean_wake_pct": mean_wake,
+        "capacity_factor": cf,
+        "rated_kw": rated_kw,
+        "n_years": n_years,
+    }
+
+
 # ── Processing pipeline ───────────────────────────────────────────────────────
 
 def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list) -> tuple:
@@ -543,6 +630,11 @@ def disaggregate_subhourly(
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
+
+MONTH_LABELS = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
 
 st.markdown("""
 <style>
@@ -1022,6 +1114,11 @@ if run_btn:
             with st.spinner(f"Disaggregating to {res_label}…"):
                 df_sub, sub_info = disaggregate_subhourly(df, res_min)
 
+        # Persist wind results so the AEP section survives re-renders without re-fetching
+        st.session_state["aep_df"] = df
+        st.session_state["aep_lat"] = lat
+        st.session_state["aep_lon"] = lon
+
         n_records = len(df_sub) if df_sub is not None else len(df)
         st.success(
             f"Done — {n_records:,} {res_label.lower()} records  "
@@ -1332,10 +1429,6 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
         )
         seasonal.columns = ["ERA5 raw 100 m", "GWA-corrected 150 m"]
 
-        MONTH_LABELS = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ]
         fig_seasonal = go.Figure()
         for col, colour in zip(seasonal.columns, ["#CBD5E1", "#4F46E5"]):
             fig_seasonal.add_trace(
@@ -1614,3 +1707,161 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
     except Exception as exc:
         st.error(f"Unexpected error: {exc}")
         raise
+
+# ── AEP Calculator ────────────────────────────────────────────────────────────
+if "aep_df" in st.session_state:
+    _df_aep = st.session_state["aep_df"]
+    _aep_lat = st.session_state.get("aep_lat", lat)
+    _aep_lon = st.session_state.get("aep_lon", lon)
+
+    _pc_df = load_power_curves()
+    _wake_df = load_wake_matrix()
+
+    st.markdown('<hr class="hr">', unsafe_allow_html=True)
+    st.markdown(
+        '<span class="lbl">AEP</span>'
+        '<p class="sh">Annual Energy Production Calculator</p>',
+        unsafe_allow_html=True,
+    )
+
+    if _pc_df is None:
+        st.info(
+            "No power curves loaded. Add `data/power_curves.xlsx` to enable AEP calculation. "
+            "Format: column 1 = wind speed (m/s), remaining columns = power (kW) per WTG, "
+            "row 1 = WTG names."
+        )
+    else:
+        _ac1, _ac2, _ac3 = st.columns([2, 1, 1])
+        with _ac1:
+            _selected_wtg = st.selectbox("Wind turbine model", options=list(_pc_df.columns))
+        with _ac2:
+            _nameplate_mw = st.number_input(
+                "Nameplate capacity (MW)",
+                min_value=0.1, max_value=5000.0, value=100.0, step=0.5, format="%.1f",
+            )
+        with _ac3:
+            _apply_wake = st.checkbox(
+                "Apply wake losses",
+                value=_wake_df is not None,
+                disabled=_wake_df is None,
+                help="Requires data/wake_loss_matrix.xlsx" if _wake_df is None else "",
+            )
+
+        # Power curve preview scaled to nameplate
+        _ws_c = _pc_df.index.values
+        _kw_c = _pc_df[_selected_wtg].values
+        _rated_kw_preview = float(_kw_c.max())
+        _mw_c = _kw_c / _rated_kw_preview * _nameplate_mw
+
+        _fig_pc = go.Figure()
+        _fig_pc.add_trace(go.Scatter(
+            x=_ws_c, y=_mw_c,
+            mode="lines",
+            line=dict(color="#4F46E5", width=2.5),
+            fill="tozeroy",
+            fillcolor="rgba(79,70,229,0.07)",
+            name=f"{_selected_wtg} — scaled to {_nameplate_mw:.1f} MW",
+        ))
+        _fig_pc.update_layout(
+            template="plotly_white",
+            xaxis=dict(title="Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
+            yaxis=dict(title="Power (MW)", gridcolor="rgba(0,0,0,0.05)"),
+            height=240,
+            margin=dict(t=10, b=40, l=55, r=20),
+            legend=dict(orientation="h", y=-0.4),
+            font=dict(color="#64748B", size=11),
+        )
+        st.plotly_chart(_fig_pc, use_container_width=True)
+
+        # Run AEP calculation
+        _ws_aep = _df_aep["ws_150m_corrected"].dropna()
+        _aep = calc_aep(
+            _ws_aep, _pc_df, _selected_wtg, _nameplate_mw,
+            _wake_df if _apply_wake else None,
+        )
+
+        # Metrics
+        def _energy_str(mwh: float) -> str:
+            return f"{mwh / 1000:.2f} GWh/yr" if mwh >= 1000 else f"{mwh:.0f} MWh/yr"
+
+        _am1, _am2, _am3, _am4 = st.columns(4)
+        _am1.metric("Gross AEP", _energy_str(_aep["gross_aep_mwh"]))
+        _am2.metric(
+            "Net AEP",
+            _energy_str(_aep["net_aep_mwh"]),
+            delta=f"−{_aep['mean_wake_pct']:.1f}% wake" if _aep["mean_wake_pct"] > 0 else None,
+            delta_color="inverse",
+        )
+        _am3.metric("Capacity Factor", f"{_aep['capacity_factor'] * 100:.1f}%")
+        _am4.metric("Rated (from curve)", f"{_aep['rated_kw'] / 1000:.2f} MW")
+
+        st.markdown(
+            f'<div class="ann">'
+            f'<strong>{_selected_wtg}</strong> normalised to rated output and scaled to '
+            f'<strong>{_nameplate_mw:.1f} MW</strong> nameplate capacity. '
+            f'{"Wake losses applied via 2D interpolation of the wind-speed × nameplate capacity matrix." if _apply_wake and _wake_df is not None else "No wake correction applied — add <code>data/wake_loss_matrix.xlsx</code> to enable."}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Monthly net energy
+        st.markdown(
+            '<p class="sh" style="margin-top:1.5rem;">Mean Monthly Net Energy</p>',
+            unsafe_allow_html=True,
+        )
+        _monthly_net = _aep["net_mw_ts"].resample("ME").sum()
+        _monthly_gross = _aep["gross_mw_ts"].resample("ME").sum()
+        _mnet_avg = _monthly_net.groupby(_monthly_net.index.month).mean()
+        _mgross_avg = _monthly_gross.groupby(_monthly_gross.index.month).mean()
+
+        _fig_maep = go.Figure()
+        _fig_maep.add_trace(go.Bar(
+            x=MONTH_LABELS, y=_mgross_avg.values,
+            name="Gross energy", marker_color="rgba(148,163,184,0.5)",
+        ))
+        _fig_maep.add_trace(go.Bar(
+            x=MONTH_LABELS, y=_mnet_avg.values,
+            name="Net energy (after wake)", marker_color="rgba(79,70,229,0.7)",
+        ))
+        _fig_maep.update_layout(
+            template="plotly_white",
+            barmode="overlay",
+            xaxis=dict(title="Month", gridcolor="rgba(0,0,0,0.05)"),
+            yaxis=dict(title="Mean Monthly Energy (MWh)", gridcolor="rgba(0,0,0,0.05)"),
+            height=290,
+            margin=dict(t=10, b=60, l=55, r=20),
+            legend=dict(orientation="h", y=-0.3),
+            font=dict(color="#64748B", size=11),
+        )
+        st.plotly_chart(_fig_maep, use_container_width=True)
+
+        # AEP CSV download
+        _aep_tz_sfx = (
+            f"UTC{_tz_offset_str(_df_aep.index)}" if tz_display != "UTC" else "UTC"
+        )
+        _aep_out = pd.DataFrame(
+            {
+                "wind_speed_ms": _ws_aep.round(1),
+                "gross_power_mw": _aep["gross_mw_ts"].round(3),
+                "wake_loss_pct": _aep["wake_pct_ts"].round(2),
+                "net_power_mw": _aep["net_mw_ts"].round(3),
+            }
+        )
+        _aep_out.index = _aep_out.index.tz_localize(None)
+        _aep_out.index.name = f"datetime_{_aep_tz_sfx}"
+        _aep_fname = (
+            f"aep_{_selected_wtg.replace(' ', '_')}_{_nameplate_mw:.1f}MW"
+            f"_{_aep_lat:.4f}_{_aep_lon:.4f}.csv"
+        )
+        st.download_button(
+            label="Download AEP time series (CSV)",
+            data=_aep_out.to_csv().encode(),
+            file_name=_aep_fname,
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.caption(
+            f"{_selected_wtg} · {_nameplate_mw:.1f} MW nameplate · "
+            f"{'Wake-corrected' if _apply_wake and _wake_df is not None else 'No wake correction'} · "
+            f"{_aep['n_years']:.1f}-year record"
+        )
