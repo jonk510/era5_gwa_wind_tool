@@ -352,16 +352,28 @@ def load_power_curves() -> pd.DataFrame | None:
         return None
     df = pd.read_excel(p, index_col=0, header=0)
     df.index = df.index.astype(float)
+    df.columns = [str(c).strip() for c in df.columns]  # strip any trailing whitespace from WTG names
     return df.sort_index()
 
 
 @st.cache_data(show_spinner=False)
 def load_wake_matrix() -> pd.DataFrame | None:
-    """Load data/wake_loss_matrix.xlsx. Returns DataFrame[nameplate_MW → %] indexed by wind speed (m/s)."""
+    """Load data/wake_loss_matrix.xlsx. Returns DataFrame[nameplate_MW → %] indexed by wind speed (m/s).
+
+    Expected layout (matches the supplied file):
+      Row 0:  title row (ignored)
+      Row 1:  col 0-1 ignored; col 2+ = nameplate capacity values (MW)
+      Row 2+: col 0 ignored; col 1 = wind speed (m/s); col 2+ = wake loss (fraction 0–1)
+    Values are converted to % (multiplied by 100) for use in calc_aep.
+    """
     p = _DATA_DIR / "wake_loss_matrix.xlsx"
     if not p.exists():
         return None
-    df = pd.read_excel(p, index_col=0, header=0)
+    raw = pd.read_excel(p, header=None)
+    nameplate_caps = raw.iloc[1, 2:].values.astype(float)
+    wind_speeds = raw.iloc[2:, 1].values.astype(float)
+    wake_fractions = raw.iloc[2:, 2:].values.astype(float)
+    df = pd.DataFrame(wake_fractions * 100.0, index=wind_speeds, columns=nameplate_caps)
     df.index = df.index.astype(float)
     df.columns = df.columns.astype(float)
     return df.sort_index().sort_index(axis=1)
