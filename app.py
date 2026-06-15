@@ -10,8 +10,10 @@ Pipeline:
   3. Weibull correction (quantile transform to match GWA 150m Weibull A & k)
 """
 
+import io
 import re
 import warnings
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -972,6 +974,151 @@ with st.sidebar:
 
 # ── Friendly display label (strips "(fake)" for headings) ────────────────────
 res_label = resolution.replace(" (fake)", "")
+
+# ── Batch processing ──────────────────────────────────────────────────────────
+with st.expander("📋 Batch — upload a site list to generate multiple time series"):
+    st.markdown(
+        "Upload an **Excel or CSV** with columns `site_name`, `latitude`, `longitude` "
+        "(WGS84 decimal degrees). ERA5 period and resolution are taken from the sidebar."
+    )
+    _bf = st.file_uploader("Site list", type=["xlsx", "csv"], label_visibility="collapsed")
+
+    if _bf is not None:
+        # Clear previous results when a new file is uploaded
+        if st.session_state.get("_batch_fname") != _bf.name:
+            st.session_state.pop("batch_zip", None)
+            st.session_state["_batch_fname"] = _bf.name
+
+        try:
+            _bdf = (
+                pd.read_csv(_bf) if _bf.name.lower().endswith(".csv")
+                else pd.read_excel(_bf)
+            )
+            _bdf.columns = [str(c).strip().lower() for c in _bdf.columns]
+            if "site_name" not in _bdf.columns:
+                _bdf.insert(0, "site_name", [f"Site_{i+1}" for i in range(len(_bdf))])
+            _missing_cols = [c for c in ["latitude", "longitude"] if c not in _bdf.columns]
+
+            if _missing_cols:
+                st.error(f"Missing required columns: {', '.join(_missing_cols)}")
+            else:
+                _bdf = _bdf[["site_name", "latitude", "longitude"]].dropna().reset_index(drop=True)
+                st.dataframe(_bdf, use_container_width=True, hide_index=True)
+                st.caption(
+                    f"{len(_bdf)} sites · ERA5 {_START_YEAR}–{_END_YEAR} · {res_label} · "
+                    f"roughness auto-detected from OSM"
+                )
+
+                _batch_go = st.button(
+                    "🚀 Process All Sites", type="primary", use_container_width=True,
+                )
+
+                if _batch_go:
+                    _zip_buf = io.BytesIO()
+                    _prog = st.progress(0, text="Starting…")
+                    _summary_rows, _batch_errors = [], []
+
+                    with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
+                        for _bi, _brow in _bdf.iterrows():
+                            _bname = str(_brow["site_name"])
+                            _blat, _blon = float(_brow["latitude"]), float(_brow["longitude"])
+                            _prog.progress(_bi / len(_bdf), text=f"Processing {_bname} ({_bi + 1}/{len(_bdf)})…")
+
+                            try:
+                                _b_era5, _b_elat, _b_elon = fetch_era5(_blat, _blon, _START_YEAR, _END_YEAR)
+                                _b_rough, _ = fetch_site_roughness(_blat, _blon)
+                                _b_gwc, _b_heights, _b_glat, _b_glon = fetch_gwa(_blat, _blon, _b_rough)
+                                _b_tz = detect_timezone(_blat, _blon)
+                                _b_tz_disp = "UTC" if use_utc else _b_tz
+                                _b_df_era5 = localise_df(_b_era5, _b_tz_disp)
+                                _b_df, _b_meta = run_pipeline(_b_df_era5, _b_gwc, _b_heights)
+                                _b_tz_sfx = f"UTC{_tz_offset_str(_b_df.index)}" if _b_tz_disp != "UTC" else "UTC"
+
+                                # Metadata header (matches single-site CSV format)
+                                _b_hdr = "\n".join([
+                                    f"# ERA5 x GWA Wind Resource Synthesis — {_bname}",
+                                    "#",
+                                    f"# Site:               {_bname}",
+                                    f"# Coordinates:        {_blat:.4f}N, {_blon:.4f}E",
+                                    f"# ERA5 grid node:     {_b_elat:.4f}N, {_b_elon:.4f}E  (~0.25 deg grid, ~28 km)",
+                                    (f"# GWA grid node:      {_b_glat:.4f}N, {_b_glon:.4f}E  (250 m grid)"
+                                     if _b_glat else "# GWA grid node:      unknown"),
+                                    f"# Timezone:           {_b_tz_disp} ({_b_tz_sfx})",
+                                    f"# Period:             {_START_YEAR}-01-01 to {_END_YEAR}-12-31",
+                                    f"# GWA mean @ 100m:    {_b_meta['mean_gwa_100']:.2f} m/s",
+                                    f"# GWA mean @ 150m:    {_b_meta['mean_gwa_150']:.2f} m/s",
+                                    f"# GWA-corrected mean: {_b_meta['mean_corrected']:.2f} m/s",
+                                    f"# Wind shear α:       {_b_meta['alpha_mean']:.3f}  (100→150 m)",
+                                    "#",
+                                    "# DATA SOURCE:        SYNTHESISED — NOT A MEASUREMENT RECORD",
+                                    "#",
+                                ]) + "\n"
+
+                                # Time series data
+                                _bcols = ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
+                                _bcnames = ["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]
+                                if "wd_100m" in _b_df.columns:
+                                    _bcols.append("wd_100m")
+                                    _bcnames.append("era5_wd_100m_deg")
+                                _bdl = _b_df[_bcols].copy()
+                                _bdl.columns = _bcnames
+                                _bdl.index = _bdl.index.tz_localize(None)
+                                _bdl.index.name = f"datetime_{_b_tz_sfx}"
+                                _bdl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]] = (
+                                    _bdl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]].round(1)
+                                )
+                                if "era5_wd_100m_deg" in _bdl.columns:
+                                    _bdl["era5_wd_100m_deg"] = _bdl["era5_wd_100m_deg"].round(0).astype(int)
+
+                                _zf.writestr(
+                                    f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}.csv",
+                                    (_b_hdr + _bdl.to_csv()).encode(),
+                                )
+
+                                _summary_rows.append({
+                                    "site_name": _bname,
+                                    "latitude": _blat,
+                                    "longitude": _blon,
+                                    "era5_grid_lat": round(_b_elat, 4),
+                                    "era5_grid_lon": round(_b_elon, 4),
+                                    "gwa_grid_lat": round(_b_glat, 4) if _b_glat else "",
+                                    "gwa_grid_lon": round(_b_glon, 4) if _b_glon else "",
+                                    "era5_mean_100m_ms": round(_b_meta["mean_era5_100"], 2),
+                                    "gwa_mean_100m_ms": round(_b_meta["mean_gwa_100"], 2),
+                                    "gwa_mean_150m_ms": round(_b_meta["mean_gwa_150"], 2),
+                                    "gwa_corrected_mean_150m_ms": round(_b_meta["mean_corrected"], 2),
+                                    "wind_shear_alpha_100_150": round(_b_meta["alpha_mean"], 3),
+                                })
+
+                            except Exception as _be:
+                                _batch_errors.append(f"{_bname}: {_be}")
+
+                        if _summary_rows:
+                            _zf.writestr(
+                                "_summary.csv",
+                                pd.DataFrame(_summary_rows).to_csv(index=False).encode(),
+                            )
+
+                    _prog.progress(1.0, text=f"Done — {len(_summary_rows)} sites processed.")
+
+                    if _batch_errors:
+                        st.warning(f"{len(_batch_errors)} site(s) failed:\n" + "\n".join(_batch_errors))
+
+                    st.session_state["batch_zip"] = _zip_buf.getvalue()
+                    st.session_state["batch_zip_name"] = f"wind_batch_{_START_YEAR}_{_END_YEAR}.zip"
+                    st.session_state["batch_n"] = len(_summary_rows)
+
+                if "batch_zip" in st.session_state:
+                    st.download_button(
+                        label=f"⬇️  Download ZIP ({st.session_state['batch_n']} sites + _summary.csv)",
+                        data=st.session_state["batch_zip"],
+                        file_name=st.session_state["batch_zip_name"],
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
+
+        except Exception as _be_outer:
+            st.error(f"Could not read file: {_be_outer}")
 
 # ── Map + method description ──────────────────────────────────────────────────
 col_map, col_method = st.columns([3, 2])
