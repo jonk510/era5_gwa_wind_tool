@@ -20,7 +20,8 @@ from datetime import datetime
 import matplotlib
 matplotlib.use("Agg")
 matplotlib.rcParams.update({
-    "font.family":       "Arial",
+    "font.family":       "sans-serif",
+    "font.sans-serif":   ["Arial", "Liberation Sans", "Helvetica", "DejaVu Sans"],
     "font.size":         9,
     "axes.titlesize":    9,
     "axes.titleweight":  "bold",
