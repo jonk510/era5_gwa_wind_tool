@@ -968,7 +968,7 @@ with st.sidebar:
     )
     n_years = st.slider(
         "Number of years", min_value=1, max_value=min(end_year - 1979, 20),
-        value=min(10, end_year - 1979),
+        value=min(5, end_year - 1979),
     )
     start_year = end_year - n_years + 1
     st.caption(f"Period: **{start_year}–{end_year}** ({n_years} yr)")
