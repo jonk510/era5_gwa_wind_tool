@@ -80,7 +80,28 @@ ESRI_TILES = (
 ESRI_ATTR = "&copy; <a href='https://www.esri.com'>Esri</a>"
 
 
-# ── GWC parser ────────────────────────────────────────────────────────────────
+# ── GWC / height helpers ──────────────────────────────────────────────────────
+
+def _gwa_at_height(gwc: dict, h: float) -> tuple[float, float, float]:
+    """Return (A, k, mean_ws) at height h by log-linear interpolation between GWC heights."""
+    heights = sorted(gwc.keys())
+    if h in gwc:
+        d = gwc[h]
+        return d["A"], d["k"], d["mean"]
+    if h <= heights[0]:
+        d = gwc[heights[0]]
+        return d["A"], d["k"], d["mean"]
+    if h >= heights[-1]:
+        d = gwc[heights[-1]]
+        return d["A"], d["k"], d["mean"]
+    h_lo = max(hv for hv in heights if hv < h)
+    h_hi = min(hv for hv in heights if hv > h)
+    t = np.log(h / h_lo) / np.log(h_hi / h_lo)
+    A = gwc[h_lo]["A"] * (gwc[h_hi]["A"] / gwc[h_lo]["A"]) ** t
+    k = gwc[h_lo]["k"] + t * (gwc[h_hi]["k"] - gwc[h_lo]["k"])
+    mean = gwc[h_lo]["mean"] * (gwc[h_hi]["mean"] / gwc[h_lo]["mean"]) ** t
+    return float(A), float(k), float(mean)
+
 
 def _combined_weibull(f_arr, A_arr, k_arr):
     """
@@ -440,41 +461,40 @@ def calc_aep(
 
 # ── Processing pipeline ───────────────────────────────────────────────────────
 
-def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list) -> tuple:
+def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: float = 150.0) -> tuple:
     """
-    Full processing pipeline:
-      1. Derive mean-shear alpha from GWA 100m / 150m means.
-      2. Build diurnal alpha profile using ERA5 10m/100m shear pattern,
-         normalised to alpha_mean.
-      3. Extrapolate ERA5 100m → 150m with diurnal alpha.
-      4. Fit Weibull to ERA5 150m estimate.
-      5. Apply Weibull quantile transform to match GWA 150m Weibull.
+    Full processing pipeline for an arbitrary hub height:
+      1. Derive mean-shear alpha from GWA 100m → hub_height means
+         (Weibull A/k interpolated log-linearly between GWC heights).
+      2. Build diurnal alpha profile using ERA5 10m/100m shear pattern.
+      3. Extrapolate ERA5 100m → hub_height with diurnal alpha.
+      4. Fit Weibull to ERA5 hub_height estimate.
+      5. Apply Weibull quantile transform to match GWA hub_height Weibull.
 
-    Returns (df, meta).
+    Returns (df, meta). Internal df columns ws_150m_raw / ws_150m_corrected
+    always refer to the hub height (the name is historical).
     """
     h100 = min(heights, key=lambda x: abs(x - 100))
-    h150 = min(heights, key=lambda x: abs(x - 150))
-
     g100 = gwc[h100]
-    g150 = gwc[h150]
-
     mean_gwa_100 = g100["mean"]
-    mean_gwa_150 = g150["mean"]
-    A_gwa_150 = g150["A"]
-    k_gwa_150 = g150["k"]
 
-    if mean_gwa_150 <= mean_gwa_100:
-        raise ValueError(
-            f"GWA mean at {h150}m ({mean_gwa_150:.2f} m/s) is not greater than "
-            f"at {h100}m ({mean_gwa_100:.2f} m/s). Check GWC parsing."
-        )
+    # GWA Weibull at hub height (interpolated between GWC heights if needed)
+    A_gwa_hub, k_gwa_hub, mean_gwa_hub = _gwa_at_height(gwc, hub_height)
 
-    # ── Step 1: GWA-derived mean shear exponent ───────────────────────────────
-    # Primary: α from 100m→150m (used for actual extrapolation)
-    alpha_mean = np.log(mean_gwa_150 / mean_gwa_100) / np.log(150 / 100)
+    # ── Step 1: GWA-derived mean shear exponent (100 m → hub_height) ─────────
+    log_h_ratio = np.log(hub_height / h100)
+    if abs(log_h_ratio) < 1e-6:
+        # hub_height ≈ ERA5 reference height — use a neighbouring GWC height
+        other = [hv for hv in heights if abs(hv - h100) > 5]
+        if other:
+            h_ref2 = min(other, key=lambda x: abs(x - h100))
+            alpha_mean = np.log(gwc[h_ref2]["mean"] / mean_gwa_100) / np.log(h_ref2 / h100)
+        else:
+            alpha_mean = 0.2
+    else:
+        alpha_mean = np.log(mean_gwa_hub / mean_gwa_100) / log_h_ratio
 
-    # Supplementary: α from 50m→150m if GWA 50m is available (spans a wider
-    # height range and is more comparable to the "industry standard" α ≈ 0.2)
+    # Supplementary: α from ~50m → hub_height (reference only, shown in UI)
     alpha_50_150 = None
     mean_gwa_50 = None
     h50_candidates = [h for h in heights if 40 <= h <= 75]
@@ -483,7 +503,9 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list) -> tuple:
         g50 = gwc.get(h50)
         if g50 and g50["mean"] > 0 and g50["mean"] < mean_gwa_100:
             mean_gwa_50 = g50["mean"]
-            alpha_50_150 = np.log(mean_gwa_150 / mean_gwa_50) / np.log(h150 / h50)
+            log_50_hub = np.log(hub_height / h50)
+            if abs(log_50_hub) > 1e-6:
+                alpha_50_150 = np.log(mean_gwa_hub / g50["mean"]) / log_50_hub
 
     # ── Step 2: ERA5 diurnal shear pattern ───────────────────────────────────
     df = df_era5.copy()
@@ -498,27 +520,25 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list) -> tuple:
         .clip(0.03, 0.8)
         .reindex(range(24), fill_value=alpha_mean)
     )
-
-    # Normalise pattern to GWA magnitude
     diurnal_alpha = diurnal_era5 / diurnal_era5.mean() * alpha_mean
 
-    # ── Step 3: Height extrapolation ─────────────────────────────────────────
+    # ── Step 3: Height extrapolation to hub_height ───────────────────────────
     df["alpha_h"] = df["hour"].map(diurnal_alpha).fillna(alpha_mean)
-    df["ws_150m_raw"] = df["ws_100m"] * (150.0 / 100.0) ** df["alpha_h"]
+    df["ws_150m_raw"] = df["ws_100m"] * (hub_height / 100.0) ** df["alpha_h"]
 
-    # ── Step 4: Fit Weibull to ERA5 150m estimate ─────────────────────────────
+    # ── Step 4: Fit Weibull to ERA5 at hub_height ────────────────────────────
     ws_clean = df["ws_150m_raw"].dropna()
     ws_clean = ws_clean[ws_clean > 0.1]
     k_era5_150, _, A_era5_150 = weibull_min.fit(ws_clean, floc=0)
 
     # ── Step 5: Weibull quantile transform ────────────────────────────────────
-    # v* = A_GWA × (v / A_ERA5)^(k_ERA5 / k_GWA)
     v = df["ws_150m_raw"].clip(lower=0.01).values
-    df["ws_150m_corrected"] = A_gwa_150 * (v / A_era5_150) ** (k_era5_150 / k_gwa_150)
+    df["ws_150m_corrected"] = A_gwa_hub * (v / A_era5_150) ** (k_era5_150 / k_gwa_hub)
 
     meta = {
+        "hub_height": hub_height,
         "h100_used": h100,
-        "h150_used": h150,
+        "h150_used": hub_height,
         "alpha_mean": alpha_mean,
         "alpha_50_150": alpha_50_150,
         "diurnal_alpha": diurnal_alpha,
@@ -527,12 +547,12 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list) -> tuple:
         "mean_corrected": df["ws_150m_corrected"].mean(),
         "mean_gwa_50": mean_gwa_50,
         "mean_gwa_100": mean_gwa_100,
-        "mean_gwa_150": mean_gwa_150,
+        "mean_gwa_150": mean_gwa_hub,
         "A_era5_150": A_era5_150,
         "k_era5_150": k_era5_150,
-        "A_gwa_150": A_gwa_150,
-        "k_gwa_150": k_gwa_150,
-        "gwa_roughness_used": g150.get("roughness"),
+        "A_gwa_150": A_gwa_hub,
+        "k_gwa_150": k_gwa_hub,
+        "gwa_roughness_used": g100.get("roughness"),
     }
 
     return df, meta
@@ -816,7 +836,7 @@ html, body, [class*="css"] {
 """, unsafe_allow_html=True)
 
 # ── Page header ───────────────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(f"""
 <div style="padding-bottom:1.25rem; margin-bottom:0.5rem; border-bottom:1px solid #E2E8F0;">
   <p style="font-size:0.7rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase;
             color:#94A3B8; margin:0 0 6px 0;">Wind Resource Tool</p>
@@ -824,7 +844,7 @@ st.markdown("""
              line-height:1.15;">ERA5 × Global Wind Atlas</h1>
   <p style="font-size:0.9rem; color:#64748B; margin:6px 0 0 0; line-height:1.4;">
     ERA5 hourly reanalysis &nbsp;·&nbsp; GWA spatial accuracy &nbsp;·&nbsp;
-    <strong style="color:#0F172A;">150 m</strong> hub height &nbsp;·&nbsp; onshore
+    <strong style="color:#0F172A;">{st.session_state.get('hub_height', 150):.0f} m</strong> hub height &nbsp;·&nbsp; onshore
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -856,6 +876,8 @@ if "lat_input" not in st.session_state:
     st.session_state["lat_input"] = -31.9505
 if "lon_input" not in st.session_state:
     st.session_state["lon_input"] = 115.8605
+if "hub_height" not in st.session_state:
+    st.session_state["hub_height"] = 150
 
 # Apply any pending map click BEFORE the sidebar widgets render.
 # (Streamlit forbids setting a widget key after it has been instantiated,
@@ -970,6 +992,16 @@ with st.sidebar:
         ),
     )
     st.divider()
+    st.markdown('<p style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#94A3B8;margin:0.25rem 0 0.3rem 0;">Hub Height</p>', unsafe_allow_html=True)
+    hub_height = st.number_input(
+        "Hub height (m)",
+        min_value=10,
+        max_value=300,
+        step=10,
+        key="hub_height",
+        help="Height for wind speed extrapolation and GWA Weibull correction.",
+    )
+    st.divider()
     run_btn = st.button("🚀  Fetch & Process Data", type="primary", use_container_width=True)
 
 # ── Friendly display label (strips "(fake)" for headings) ────────────────────
@@ -1005,8 +1037,11 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                 _has_wtg = "wtg_model" in _bdf_raw.columns
                 _has_cap = "nameplate_mw" in _bdf_raw.columns
                 _has_aep = _has_wtg and _has_cap
+                _has_hh_col = "hub_height_m" in _bdf_raw.columns
 
                 _keep_cols = ["site_name", "latitude", "longitude"]
+                if _has_hh_col:
+                    _keep_cols.append("hub_height_m")
                 if _has_wtg:
                     _keep_cols.append("wtg_model")
                 if _has_cap:
@@ -1037,6 +1072,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
 
                 st.caption(
                     f"{len(_bdf)} sites · ERA5 {_START_YEAR}–{_END_YEAR} · {res_label}"
+                    + (" · per-site hub height" if _has_hh_col else f" · hub height {hub_height:.0f} m")
                     + (" · AEP enabled (wind + AEP CSV per site)" if _has_aep else "")
                 )
 
@@ -1054,13 +1090,15 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                             _prog.progress(_bi / len(_bdf), text=f"Processing {_bname} ({_bi + 1}/{len(_bdf)})…")
 
                             try:
+                                _b_hub_h = float(_brow["hub_height_m"]) if _has_hh_col and pd.notna(_brow.get("hub_height_m")) else float(hub_height)
+                                _b_hh_int = int(_b_hub_h)
                                 _b_era5, _b_elat, _b_elon = fetch_era5(_blat, _blon, _START_YEAR, _END_YEAR)
                                 _b_rough, _ = fetch_site_roughness(_blat, _blon)
                                 _b_gwc, _b_heights, _b_glat, _b_glon = fetch_gwa(_blat, _blon, _b_rough)
                                 _b_tz = detect_timezone(_blat, _blon)
                                 _b_tz_disp = "UTC" if use_utc else _b_tz
                                 _b_df_era5 = localise_df(_b_era5, _b_tz_disp)
-                                _b_df, _b_meta = run_pipeline(_b_df_era5, _b_gwc, _b_heights)
+                                _b_df, _b_meta = run_pipeline(_b_df_era5, _b_gwc, _b_heights, hub_height=_b_hub_h)
                                 _b_tz_sfx = f"UTC{_tz_offset_str(_b_df.index)}" if _b_tz_disp != "UTC" else "UTC"
 
                                 # ── Wind CSV ───────────────────────────────────────────────────────
@@ -1074,17 +1112,20 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                      if _b_glat else "# GWA grid node:      unknown"),
                                     f"# Timezone:           {_b_tz_disp} ({_b_tz_sfx})",
                                     f"# Period:             {_START_YEAR}-01-01 to {_END_YEAR}-12-31",
+                                    f"# Hub height:         {_b_hh_int} m",
                                     f"# GWA mean @ 100m:    {_b_meta['mean_gwa_100']:.2f} m/s",
-                                    f"# GWA mean @ 150m:    {_b_meta['mean_gwa_150']:.2f} m/s",
+                                    f"# GWA mean @ {_b_hh_int}m:    {_b_meta['mean_gwa_150']:.2f} m/s",
                                     f"# GWA-corrected mean: {_b_meta['mean_corrected']:.2f} m/s",
-                                    f"# Wind shear α:       {_b_meta['alpha_mean']:.3f}  (100→150 m)",
+                                    f"# Wind shear α:       {_b_meta['alpha_mean']:.3f}  (100→{_b_hh_int} m)",
                                     "#",
                                     "# DATA SOURCE:        SYNTHESISED — NOT A MEASUREMENT RECORD",
                                     "#",
                                 ]) + "\n"
 
+                                _b_col_extrap = f"era5_ws_{_b_hh_int}m_extrap_ms"
+                                _b_col_corr = f"gwa_corrected_ws_{_b_hh_int}m_ms"
                                 _bcols = ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
-                                _bcnames = ["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]
+                                _bcnames = ["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]
                                 if "wd_100m" in _b_df.columns:
                                     _bcols.append("wd_100m")
                                     _bcnames.append("era5_wd_100m_deg")
@@ -1092,8 +1133,8 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                 _bdl.columns = _bcnames
                                 _bdl.index = _bdl.index.tz_localize(None)
                                 _bdl.index.name = f"datetime_{_b_tz_sfx}"
-                                _bdl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]] = (
-                                    _bdl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]].round(1)
+                                _bdl[["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]] = (
+                                    _bdl[["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]].round(1)
                                 )
                                 if "era5_wd_100m_deg" in _bdl.columns:
                                     _bdl["era5_wd_100m_deg"] = _bdl["era5_wd_100m_deg"].round(0).astype(int)
@@ -1169,15 +1210,16 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     "site_name": _bname,
                                     "latitude": _blat,
                                     "longitude": _blon,
+                                    "hub_height_m": _b_hh_int,
                                     "era5_grid_lat": round(_b_elat, 4),
                                     "era5_grid_lon": round(_b_elon, 4),
                                     "gwa_grid_lat": round(_b_glat, 4) if _b_glat else "",
                                     "gwa_grid_lon": round(_b_glon, 4) if _b_glon else "",
                                     "era5_mean_100m_ms": round(_b_meta["mean_era5_100"], 2),
                                     "gwa_mean_100m_ms": round(_b_meta["mean_gwa_100"], 2),
-                                    "gwa_mean_150m_ms": round(_b_meta["mean_gwa_150"], 2),
-                                    "gwa_corrected_mean_150m_ms": round(_b_meta["mean_corrected"], 2),
-                                    "wind_shear_alpha_100_150": round(_b_meta["alpha_mean"], 3),
+                                    f"gwa_mean_{_b_hh_int}m_ms": round(_b_meta["mean_gwa_150"], 2),
+                                    f"gwa_corrected_mean_{_b_hh_int}m_ms": round(_b_meta["mean_corrected"], 2),
+                                    f"wind_shear_alpha_100_{_b_hh_int}": round(_b_meta["alpha_mean"], 3),
                                     **_sum_aep,
                                 })
 
@@ -1296,7 +1338,8 @@ with col_map:
 
 with col_method:
     st.markdown('<span class="lbl">Processing Pipeline</span><p class="sh">How the synthesis works</p>', unsafe_allow_html=True)
-    st.markdown("""
+    _hh = st.session_state.get('hub_height', 150)
+    st.markdown(f"""
     <div class="step">
       <div class="step-n">1</div>
       <div>
@@ -1307,15 +1350,15 @@ with col_method:
     <div class="step">
       <div class="step-n">2</div>
       <div>
-        <div class="step-title">Height extrapolation → 150 m <span class="tag tag-era5">ERA5</span><span class="tag tag-gwa">GWA</span></div>
-        <div class="step-desc">Power-law with a diurnal shear exponent α. Shape from ERA5 10m/100m ratio; mean magnitude calibrated to GWA 100m/150m shear.</div>
+        <div class="step-title">Height extrapolation → {_hh:.0f} m <span class="tag tag-era5">ERA5</span><span class="tag tag-gwa">GWA</span></div>
+        <div class="step-desc">Power-law with a diurnal shear exponent α. Shape from ERA5 10m/100m ratio; mean magnitude calibrated to GWA 100m/{_hh:.0f}m shear.</div>
       </div>
     </div>
     <div class="step">
       <div class="step-n">3</div>
       <div>
         <div class="step-title">Weibull correction <span class="tag tag-synth">Synthesised</span></div>
-        <div class="step-desc">Quantile transform morphs the ERA5 distribution to match GWA 150 m Weibull (A, k). Rank order and all temporal patterns are preserved exactly.</div>
+        <div class="step-desc">Quantile transform morphs the ERA5 distribution to match GWA {_hh:.0f} m Weibull (A, k). Rank order and all temporal patterns are preserved exactly.</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1351,7 +1394,7 @@ if run_btn:
         df_era5 = localise_df(df_era5_utc, tz_display)
 
         with st.spinner("Running processing pipeline…"):
-            df, meta = run_pipeline(df_era5, gwc, heights)
+            df, meta = run_pipeline(df_era5, gwc, heights, hub_height=hub_height)
 
         tz_label = "UTC" if tz_display == "UTC" else f"{tz_detected} (UTC{_tz_offset_str(df.index)})"
 
@@ -1367,6 +1410,7 @@ if run_btn:
         st.session_state["aep_df"] = df
         st.session_state["aep_lat"] = lat
         st.session_state["aep_lon"] = lon
+        st.session_state["aep_hub_height"] = hub_height
 
         n_records = len(df_sub) if df_sub is not None else len(df)
         st.success(
@@ -1383,23 +1427,23 @@ if run_btn:
             f"{meta['mean_era5_100']:.2f} m/s",
         )
         c2.metric(
-            f"ERA5 height-extrap. @ 150 m",
+            f"ERA5 height-extrap. @ {hub_height:.0f} m",
             f"{meta['mean_era5_150_raw']:.2f} m/s",
             delta=f"{meta['mean_era5_150_raw'] - meta['mean_era5_100']:+.2f} m/s",
         )
         c3.metric(
-            "GWA-corrected @ 150 m",
+            f"GWA-corrected @ {hub_height:.0f} m",
             f"{meta['mean_corrected']:.2f} m/s",
             delta=f"{meta['mean_corrected'] - meta['mean_era5_150_raw']:+.2f} m/s vs extrap.",
         )
 
         c4, c5, c6 = st.columns(3)
         c4.metric("GWA mean @ 100 m", f"{meta['mean_gwa_100']:.2f} m/s")
-        c5.metric("GWA mean @ 150 m", f"{meta['mean_gwa_150']:.2f} m/s")
+        c5.metric(f"GWA mean @ {hub_height:.0f} m", f"{meta['mean_gwa_150']:.2f} m/s")
         c6.metric(
-            "Wind shear α (100→150 m)",
+            f"Wind shear α (100→{hub_height:.0f} m)",
             f"{meta['alpha_mean']:.3f}",
-            delta=f"α 50→150 m = {meta['alpha_50_150']:.3f}" if meta["alpha_50_150"] else None,
+            delta=f"α 50→{hub_height:.0f} m = {meta['alpha_50_150']:.3f}" if meta["alpha_50_150"] else None,
             delta_color="off",
         )
 
@@ -1413,7 +1457,7 @@ if run_btn:
         st.markdown(f"""
         <div class="ann">
         <strong>Reading these numbers:</strong> ERA5 raw 100 m is the original reanalysis.
-        ERA5 extrap. 150 m applies the diurnal power-law shear. GWA-corrected 150 m is the
+        ERA5 extrap. {hub_height:.0f} m applies the diurnal power-law shear. GWA-corrected {hub_height:.0f} m is the
         final synthesised output — Weibull-transformed to match GWA's site statistics.{_rough_note}
         </div>
         """, unsafe_allow_html=True)
@@ -1422,20 +1466,20 @@ if run_btn:
             wb_tbl = pd.DataFrame(
                 {
                     "Parameter": ["A — scale (m/s)", "k — shape"],
-                    "ERA5 150 m (extrapolated)": [
+                    f"ERA5 {hub_height:.0f} m (extrapolated)": [
                         f"{meta['A_era5_150']:.3f}",
                         f"{meta['k_era5_150']:.3f}",
                     ],
-                    "GWA target 150 m": [
+                    f"GWA target {hub_height:.0f} m": [
                         f"{meta['A_gwa_150']:.3f}",
                         f"{meta['k_gwa_150']:.3f}",
                     ],
                 }
             ).set_index("Parameter")
             st.dataframe(wb_tbl, use_container_width=True)
-            st.markdown("""
+            st.markdown(f"""
             <div class="ann" style="margin-top:10px;">
-            The quantile transform maps each ERA5 150 m value to the equivalent quantile
+            The quantile transform maps each ERA5 {hub_height:.0f} m value to the equivalent quantile
             in the GWA Weibull — rank order (and all temporal patterns) are preserved
             while the speed distribution is reshaped to match GWA's A and k.
             </div>
@@ -1459,8 +1503,8 @@ if run_btn:
             si = sub_info
             sb1, sb2, sb3, sb4 = st.columns(4)
             sb1.metric("Output resolution", res_label)
-            sb2.metric("Mean TI @ 150 m", f"{si['mean_TI_150']*100:.1f} %")
-            sb3.metric("Mean σ_u @ 150 m", f"{si['mean_sigma']:.2f} m/s")
+            sb2.metric(f"Mean TI @ {hub_height:.0f} m", f"{si['mean_TI_150']*100:.1f} %")
+            sb3.metric(f"Mean σ_u @ {hub_height:.0f} m", f"{si['mean_sigma']:.2f} m/s")
             sb4.metric("AR(1) φ per step", f"{si['phi_sub']:.3f}")
 
             with st.expander("Disaggregation method"):
@@ -1468,15 +1512,15 @@ if run_btn:
                     f"""
 **Turbulence intensity source:** {si['ti_method']}
 
-The per-hour σᵤ at 150 m is estimated from the ERA5 gust factor at 10 m:
+The per-hour σᵤ at {hub_height:.0f} m is estimated from the ERA5 gust factor at 10 m:
 
 $$TI_{{10m}} = \\frac{{V_{{gust}}/V_{{10m}} - 1}}{{3.5}}$$
 
-$$TI_{{150m}} = TI_{{10m}} \\times \\left(\\frac{{10}}{{150}}\\right)^{{0.11}}$$
+$$TI_{{{hub_height:.0f}m}} = TI_{{10m}} \\times \\left(\\frac{{10}}{{{hub_height:.0f}}}\\right)^{{0.11}}$$
 
-The standard deviation for {res_label} *mean* output is reduced from instantaneous TI using the ratio of the integral time scale (≈ 350 s at 150 m) to the averaging period ({si['resolution_min'] * 60} s):
+The standard deviation for {res_label} *mean* output is reduced from instantaneous TI using the ratio of the integral time scale (≈ 350 s at {hub_height:.0f} m) to the averaging period ({si['resolution_min'] * 60} s):
 
-$$\\sigma_{{\\text{{{res_label}}}}} = TI_{{150m}} \\times V_{{150m}} \\times \\sqrt{{T_{{int}} / T_{{avg}}}} \\approx {si['spectral_factor']:.2f} \\times \\sigma_{{\\text{{instantaneous}}}}$$
+$$\\sigma_{{\\text{{{res_label}}}}} = TI_{{{hub_height:.0f}m}} \\times V_{{{hub_height:.0f}m}} \\times \\sqrt{{T_{{int}} / T_{{avg}}}} \\approx {si['spectral_factor']:.2f} \\times \\sigma_{{\\text{{instantaneous}}}}$$
 
 A **continuous AR(1) process** is then generated at {res_label} timesteps across the full record. The AR(1) coefficient (φ = {si['phi_sub']:.3f} per {si['resolution_min']}-min step) is derived from the hourly autocorrelation assuming a continuous-time Ornstein-Uhlenbeck process. Each hourly block's noise is mean-corrected to exactly preserve the ERA5 hourly means.
                     """
@@ -1514,7 +1558,7 @@ A **continuous AR(1) process** is then generated at {res_label} timesteps across
                 template="plotly_white",
                 title=dict(text=f"{res_label} stochastic disaggregation — 5-day sample (fake)", font=dict(size=13, color="#0F172A")),
                 xaxis_title=f"Date/Time ({tz_display})",
-                yaxis_title="Wind Speed @ 150 m (m/s)",
+                yaxis_title=f"Wind Speed @ {hub_height:.0f} m (m/s)",
                 height=320,
                 margin=dict(t=40, b=50, l=55, r=20),
                 legend=dict(orientation="h", y=-0.3),
@@ -1525,15 +1569,15 @@ A **continuous AR(1) process** is then generated at {res_label} timesteps across
             st.plotly_chart(fig_sub, use_container_width=True)
 
         # ── Diurnal shear profile ─────────────────────────────────────────────
-        st.markdown('<span class="lbl">Shear</span><p class="sh">Wind Shear Exponent α — 100 m → 150 m</p>', unsafe_allow_html=True)
+        st.markdown(f'<span class="lbl">Shear</span><p class="sh">Wind Shear Exponent α — 100 m → {hub_height:.0f} m</p>', unsafe_allow_html=True)
 
         da = meta["diurnal_alpha"]
         alpha_min, alpha_max = float(da.min()), float(da.max())
 
         sh_cols = st.columns(4) if meta["alpha_50_150"] else st.columns(3)
-        sh_cols[0].metric("α (GWA 100→150 m)", f"{meta['alpha_mean']:.3f}")
+        sh_cols[0].metric(f"α (GWA 100→{hub_height:.0f} m)", f"{meta['alpha_mean']:.3f}")
         if meta["alpha_50_150"]:
-            sh_cols[1].metric("α (GWA 50→150 m)", f"{meta['alpha_50_150']:.3f}")
+            sh_cols[1].metric(f"α (GWA 50→{hub_height:.0f} m)", f"{meta['alpha_50_150']:.3f}")
             sh_cols[2].metric(f"Min α  (hour {int(da.idxmin()):02d}:00)", f"{alpha_min:.3f}")
             sh_cols[3].metric(f"Max α  (hour {int(da.idxmax()):02d}:00)", f"{alpha_max:.3f}")
         else:
@@ -1543,23 +1587,25 @@ A **continuous AR(1) process** is then generated at {res_label} timesteps across
         with st.expander("How is shear calculated?"):
             _gwa50_eq = ""
             if meta["alpha_50_150"] and meta["mean_gwa_50"]:
+                _log_denom_50 = f"ln({hub_height:.0f}/{50})"
                 _gwa50_eq = f"""
-**GWA 50→150 m (supplementary):**
+**GWA 50→{hub_height:.0f} m (supplementary):**
 
-$$\\alpha_{{50\\text{{-}}150}} = \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_50']:.2f})}}{{\\ln(150/50)}} = {meta['alpha_50_150']:.3f}$$
+$$\\alpha_{{50\\text{{-}}{hub_height:.0f}}} = \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_50']:.2f})}}{{{_log_denom_50}}} = {meta['alpha_50_150']:.3f}$$
 
 This spans a wider height range and tends to be closer to the standard wind industry
-value of ~0.2. It is shown for reference only — the 100→150 m α is used for extrapolation
+value of ~0.2. It is shown for reference only — the 100→{hub_height:.0f} m α is used for extrapolation
 because it most accurately represents the shear in the layer we are extrapolating across.
 """
             _diurnal_signal = "low" if (alpha_max - alpha_min) < 0.05 else "moderate" if (alpha_max - alpha_min) < 0.15 else "strong"
+            _log_ratio = f"ln({hub_height:.0f}/100)"
             st.markdown(
                 f"""
 The shear exponent α is **diurnal** — it varies hour-by-hour, not a single constant.
 
-**Step 1 — Mean magnitude from GWA (100→150 m)**
+**Step 1 — Mean magnitude from GWA (100→{hub_height:.0f} m)**
 
-$$\\alpha_{{\\text{{mean}}}} = \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_100']:.2f})}}{{\\ln(1.5)}} = {meta['alpha_mean']:.3f}$$
+$$\\alpha_{{\\text{{mean}}}} = \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_100']:.2f})}}{{{_log_ratio}}} = {meta['alpha_mean']:.3f}$$
 {_gwa50_eq}
 **Step 2 — Diurnal pattern from ERA5**
 The hourly shape of α is inferred from ERA5 10m/100m ratios — stable nights produce
@@ -1568,7 +1614,7 @@ mean equals α_mean from Step 1.
 
 **Result** — every hourly record extrapolated with its own hour-specific α:
 
-$$V_{{150}}(t) = V_{{100}}(t) \\times \\left(\\frac{{150}}{{100}}\\right)^{{\\alpha(h)}}, \\quad h = \\text{{hour of day ({tz_display})}}$$
+$$V_{{{hub_height:.0f}}}(t) = V_{{100}}(t) \\times \\left(\\frac{{{hub_height:.0f}}}{{100}}\\right)^{{\\alpha(h)}}, \\quad h = \\text{{hour of day ({tz_display})}}$$
 
 Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal).
                 """
@@ -1606,14 +1652,14 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         )
         st.plotly_chart(fig_alpha, use_container_width=True)
         _a50_note = (
-            f" The 50→150 m span (α = {meta['alpha_50_150']:.3f}) is typically closer to the "
-            f"industry-standard ≈ 0.2 — the 100→150 m value is lower because shear decreases "
+            f" The 50→{hub_height:.0f} m span (α = {meta['alpha_50_150']:.3f}) is typically closer to the "
+            f"industry-standard ≈ 0.2 — the 100→{hub_height:.0f} m value is lower because shear decreases "
             f"with height in a well-mixed boundary layer."
             if meta["alpha_50_150"] else ""
         )
         st.markdown(f"""
         <div class="ann">
-        <strong>Mean α ({meta['alpha_mean']:.3f})</strong> is anchored to GWA's 100→150 m speed ratio,
+        <strong>Mean α ({meta['alpha_mean']:.3f})</strong> is anchored to GWA's 100→{hub_height:.0f} m speed ratio,
         which sets the long-term shear used for height extrapolation. Hourly variation comes
         from ERA5's 10m/100m ratio, capturing the real stability cycle.{_a50_note}
         </div>
@@ -1627,8 +1673,8 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         ]
         monthly.columns = [
             "ERA5 raw 100 m",
-            "ERA5 extrap. 150 m",
-            "GWA-corrected 150 m",
+            f"ERA5 extrap. {hub_height:.0f} m",
+            f"GWA-corrected {hub_height:.0f} m",
         ]
 
         fig_monthly = go.Figure()
@@ -1665,7 +1711,7 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
             ]
             .mean()
         )
-        seasonal.columns = ["ERA5 raw 100 m", "GWA-corrected 150 m"]
+        seasonal.columns = ["ERA5 raw 100 m", f"GWA-corrected {hub_height:.0f} m"]
 
         fig_seasonal = go.Figure()
         for col, colour in zip(seasonal.columns, ["#CBD5E1", "#4F46E5"]):
@@ -1690,7 +1736,7 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         st.plotly_chart(fig_seasonal, use_container_width=True)
 
         # ── Weibull distribution ──────────────────────────────────────────────
-        st.markdown('<span class="lbl">Distribution</span><p class="sh">Wind Speed Distribution @ 150 m</p>', unsafe_allow_html=True)
+        st.markdown(f'<span class="lbl">Distribution</span><p class="sh">Wind Speed Distribution @ {hub_height:.0f} m</p>', unsafe_allow_html=True)
         st.caption(
             "Bars show empirical frequency; dashed line is the GWA Weibull target. "
             "The green bars should closely follow the dashed line."
@@ -1713,7 +1759,7 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
             go.Bar(
                 x=bc,
                 y=h_raw * bin_w,
-                name="ERA5 extrap. 150 m",
+                name=f"ERA5 extrap. {hub_height:.0f} m",
                 marker_color="rgba(148,163,184,0.45)",
                 width=bin_w,
             )
@@ -1722,7 +1768,7 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
             go.Bar(
                 x=bc,
                 y=h_corr * bin_w,
-                name="GWA-corrected 150 m",
+                name=f"GWA-corrected {hub_height:.0f} m",
                 marker_color="rgba(79,70,229,0.55)",
                 width=bin_w,
             )
@@ -1759,7 +1805,7 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         st.markdown('<span class="lbl">Full Record</span><p class="sh">Daily Mean Wind Speed</p>', unsafe_allow_html=True)
 
         daily = df.resample("D").mean()[["ws_100m", "ws_150m_corrected"]]
-        daily.columns = ["ERA5 raw 100 m", "GWA-corrected 150 m"]
+        daily.columns = ["ERA5 raw 100 m", f"GWA-corrected {hub_height:.0f} m"]
 
         fig_ts = go.Figure()
         fig_ts.add_trace(go.Scatter(
@@ -1768,8 +1814,8 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
             line=dict(color="#CBD5E1", width=0.9),
         ))
         fig_ts.add_trace(go.Scatter(
-            x=daily.index, y=daily["GWA-corrected 150 m"],
-            mode="lines", name="GWA-corrected 150 m",
+            x=daily.index, y=daily[f"GWA-corrected {hub_height:.0f} m"],
+            mode="lines", name=f"GWA-corrected {hub_height:.0f} m",
             line=dict(color="#4F46E5", width=1.2),
         ))
         if df_sub is not None:
@@ -1820,10 +1866,10 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
                 mode="lines", name="ERA5 raw 100 m",
                 line=dict(color="#CBD5E1", width=2.0, shape="hv"),
             ))
-            # GWA-corrected 150 m — indigo steps
+            # GWA-corrected hub_height m — indigo steps
             fig_day.add_trace(go.Scatter(
                 x=day_h.index, y=day_h["ws_150m_corrected"],
-                mode="lines", name="GWA-corrected 150 m",
+                mode="lines", name=f"GWA-corrected {hub_height:.0f} m",
                 line=dict(color="#4F46E5", width=2.5, shape="hv"),
             ))
             # Sub-hourly fake — emerald continuous line
@@ -1892,33 +1938,36 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         ]
         _file_header = "\n".join(_header_lines) + "\n"
 
+        _hh_int = int(hub_height)
+        _col_extrap = f"era5_ws_{_hh_int}m_extrap_ms"
+        _col_corr = f"gwa_corrected_ws_{_hh_int}m_ms"
+
         if df_sub is not None:
             # Sub-hourly speed + hourly direction repeated for each sub-hourly step
             dl = _prep_index(df_sub[["ws_150m_subhourly"]].copy())
-            dl.columns = ["gwa_corrected_ws_150m_ms"]
-            dl["gwa_corrected_ws_150m_ms"] = dl["gwa_corrected_ws_150m_ms"].round(1)
+            dl.columns = [_col_corr]
+            dl[_col_corr] = dl[_col_corr].round(1)
             if _has_wd:
-                # Forward-fill hourly direction to sub-hourly timestamps
                 wd_sub = df["wd_100m"].reindex(df_sub.index, method="ffill")
                 dl["era5_wd_100m_deg"] = wd_sub.round(0).astype(int).values
             csv_bytes = (_file_header + dl.to_csv()).encode()
             dl_label = f"Download {res_label} time series (CSV)"
             dl_caption = (
-                f"ws: GWA-corrected 150 m (m/s, 1 dp, {res_label} stochastic fake) · "
+                f"ws: GWA-corrected {_hh_int} m (m/s, 1 dp, {res_label} stochastic fake) · "
                 f"wd: ERA5 100 m (°, hourly repeated) · Timestamps: {_tz_suffix}"
             )
-            dl_fname = f"wind_150m_{res_label}_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
+            dl_fname = f"wind_{_hh_int}m_{res_label}_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
         else:
             # Hourly: speed columns + wind direction
             cols = ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
-            col_names = ["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]
+            col_names = ["era5_ws_100m_ms", _col_extrap, _col_corr]
             if _has_wd:
                 cols.append("wd_100m")
                 col_names.append("era5_wd_100m_deg")
             dl = _prep_index(df[cols])
             dl.columns = col_names
-            dl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]] = (
-                dl[["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]].round(1)
+            dl[["era5_ws_100m_ms", _col_extrap, _col_corr]] = (
+                dl[["era5_ws_100m_ms", _col_extrap, _col_corr]].round(1)
             )
             if _has_wd:
                 dl["era5_wd_100m_deg"] = dl["era5_wd_100m_deg"].round(0).astype(int)
@@ -1927,7 +1976,7 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
             dl_caption = (
                 f"Speeds in m/s (1 dp) · Direction in ° (0–360) · Timestamps: {_tz_suffix}"
             )
-            dl_fname = f"wind_150m_hourly_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
+            dl_fname = f"wind_{_hh_int}m_hourly_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
 
         st.download_button(
             label=dl_label,
