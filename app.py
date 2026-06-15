@@ -1036,11 +1036,13 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                 st.error(f"Missing required columns: {', '.join(_missing_cols)}")
             else:
                 _has_wtg = "turbine_type" in _bdf_raw.columns
-                # Accept "nameplate" or "nameplate_mw"
+                # Accept "name_plate", "nameplate", or "nameplate_mw"
                 if "nameplate_mw" in _bdf_raw.columns:
                     _cap_col = "nameplate_mw"
                 elif "nameplate" in _bdf_raw.columns:
                     _cap_col = "nameplate"
+                elif "name_plate" in _bdf_raw.columns:
+                    _cap_col = "name_plate"
                 else:
                     _cap_col = None
                 _has_cap = _cap_col is not None
