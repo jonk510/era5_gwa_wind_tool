@@ -1010,9 +1010,10 @@ res_label = resolution.replace(" (fake)", "")
 # ── Batch processing ──────────────────────────────────────────────────────────
 with st.expander("📋 Batch — upload a site list to generate multiple time series"):
     st.markdown(
-        "Upload an **Excel or CSV** with columns `site_name`, `latitude`, `longitude` "
-        "(WGS84 decimal degrees). Add `wtg_model` and `nameplate_mw` columns to also "
-        "generate AEP outputs per site. ERA5 period and resolution are taken from the sidebar."
+        "Upload an **Excel or CSV** with columns `site_name`, `latitude`, `longitude`, "
+        "`hub_height`, `turbine_type` (WGS84 decimal degrees). "
+        "Add `nameplate_mw` to scale to a specific park capacity; otherwise rated kW from the power curve is used. "
+        "ERA5 period and resolution are taken from the sidebar."
     )
     _bf = st.file_uploader("Site list", type=["xlsx", "csv"], label_visibility="collapsed")
 
@@ -1036,7 +1037,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
             else:
                 _has_wtg = "turbine_type" in _bdf_raw.columns
                 _has_cap = "nameplate_mw" in _bdf_raw.columns
-                _has_aep = _has_wtg and _has_cap
+                _has_aep = _has_wtg
                 _has_hh_col = "hub_height" in _bdf_raw.columns
 
                 _keep_cols = ["site_name", "latitude", "longitude"]
@@ -1131,6 +1132,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _bcnames.append("era5_wd_100m_deg")
                                 _bdl = _b_df[_bcols].copy()
                                 _bdl.columns = _bcnames
+                                _bdl.insert(0, "site_name", _bname)
                                 _bdl.index = _bdl.index.tz_localize(None)
                                 _bdl.index.name = f"datetime_{_b_tz_sfx}"
                                 _bdl[["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]] = (
@@ -1140,21 +1142,22 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _bdl["era5_wd_100m_deg"] = _bdl["era5_wd_100m_deg"].round(0).astype(int)
 
                                 _zf.writestr(
-                                    f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}_wind.csv",
+                                    f"{_bname.replace(' ', '_')}_wind.csv",
                                     (_b_hdr + _bdl.to_csv()).encode(),
                                 )
 
-                                # ── AEP CSV (if wtg_model + nameplate_mw provided) ──────────────
+                                # ── AEP CSV (if turbine_type provided) ─────────────────────────
                                 _sum_aep: dict = {}
                                 _b_wtg = str(_brow.get("turbine_type", "")).strip() if _has_aep else ""
-                                _b_cap_raw = _brow.get("nameplate_mw") if _has_aep else None
 
-                                if (
-                                    _has_aep
-                                    and _b_wtg in _b_pc_df.columns
-                                    and pd.notna(_b_cap_raw)
-                                ):
-                                    _b_cap = float(_b_cap_raw)
+                                if _has_aep and _b_wtg in _b_pc_df.columns:
+                                    # nameplate_mw is optional — fall back to rated kW from curve
+                                    _b_cap_raw = _brow.get("nameplate_mw") if _has_cap else None
+                                    if _b_cap_raw is None or pd.isna(_b_cap_raw):
+                                        _b_cap = float(_b_pc_df[_b_wtg].max()) / 1000.0
+                                    else:
+                                        _b_cap = float(_b_cap_raw)
+
                                     _b_ws_aep = _b_df["ws_150m_corrected"].dropna()
                                     _b_aep = calc_aep(_b_ws_aep, _b_pc_df, _b_wtg, _b_cap, _b_wake_df)
 
@@ -1184,6 +1187,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     ]) + "\n"
 
                                     _b_aep_out = pd.DataFrame({
+                                        "site_name": _bname,
                                         "wind_speed_ms": _b_ws_aep.round(1),
                                         "gross_power_mw": _b_aep["gross_mw_ts"].round(3),
                                         "wake_loss_pct": _b_aep["wake_pct_ts"].round(2),
@@ -1193,12 +1197,12 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _b_aep_out.index.name = f"datetime_{_b_tz_sfx}"
 
                                     _zf.writestr(
-                                        f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}_aep.csv",
+                                        f"{_bname.replace(' ', '_')}_aep.csv",
                                         (_b_aep_hdr + _b_aep_out.to_csv()).encode(),
                                     )
 
                                     _sum_aep = {
-                                        "wtg_model": _b_wtg,
+                                        "turbine_type": _b_wtg,
                                         "nameplate_mw": _b_cap,
                                         "gross_aep_mwh_yr": round(_b_aep["gross_aep_mwh"], 0),
                                         "net_aep_mwh_yr": round(_b_aep["net_aep_mwh"], 0),
