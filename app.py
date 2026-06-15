@@ -1087,6 +1087,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                     with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
                         for _bi, _brow in _bdf.iterrows():
                             _bname = str(_brow["site_name"])
+                            _bname_safe = re.sub(r'[/\\:*?"<>|]', '-', _bname).replace(' ', '_')
                             _blat, _blon = float(_brow["latitude"]), float(_brow["longitude"])
                             _prog.progress(_bi / len(_bdf), text=f"Processing {_bname} ({_bi + 1}/{len(_bdf)})…")
 
@@ -1142,7 +1143,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _bdl["era5_wd_100m_deg"] = _bdl["era5_wd_100m_deg"].round(0).astype(int)
 
                                 _zf.writestr(
-                                    f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}_wind.csv",
+                                    f"{_bname_safe}_{_blat:.4f}_{_blon:.4f}_wind.csv",
                                     (_b_hdr + _bdl.to_csv()).encode(),
                                 )
 
@@ -1197,7 +1198,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _b_aep_out.index.name = f"datetime_{_b_tz_sfx}"
 
                                     _zf.writestr(
-                                        f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}_aep.csv",
+                                        f"{_bname_safe}_{_blat:.4f}_{_blon:.4f}_aep.csv",
                                         (_b_aep_hdr + _b_aep_out.to_csv()).encode(),
                                     )
 
@@ -1221,9 +1222,9 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     "gwa_grid_lon": round(_b_glon, 4) if _b_glon else "",
                                     "era5_mean_100m_ms": round(_b_meta["mean_era5_100"], 2),
                                     "gwa_mean_100m_ms": round(_b_meta["mean_gwa_100"], 2),
-                                    f"gwa_mean_{_b_hh_int}m_ms": round(_b_meta["mean_gwa_150"], 2),
-                                    f"gwa_corrected_mean_{_b_hh_int}m_ms": round(_b_meta["mean_corrected"], 2),
-                                    f"wind_shear_alpha_100_{_b_hh_int}": round(_b_meta["alpha_mean"], 3),
+                                    "gwa_mean_hub_ms": round(_b_meta["mean_gwa_150"], 2),
+                                    "gwa_corrected_mean_hub_ms": round(_b_meta["mean_corrected"], 2),
+                                    "wind_shear_alpha": round(_b_meta["alpha_mean"], 3),
                                     **_sum_aep,
                                 })
 
