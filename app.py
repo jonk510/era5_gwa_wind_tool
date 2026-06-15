@@ -1142,7 +1142,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _bdl["era5_wd_100m_deg"] = _bdl["era5_wd_100m_deg"].round(0).astype(int)
 
                                 _zf.writestr(
-                                    f"{_bname.replace(' ', '_')}_wind.csv",
+                                    f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}_wind.csv",
                                     (_b_hdr + _bdl.to_csv()).encode(),
                                 )
 
@@ -1197,7 +1197,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _b_aep_out.index.name = f"datetime_{_b_tz_sfx}"
 
                                     _zf.writestr(
-                                        f"{_bname.replace(' ', '_')}_aep.csv",
+                                        f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}_aep.csv",
                                         (_b_aep_hdr + _b_aep_out.to_csv()).encode(),
                                     )
 
