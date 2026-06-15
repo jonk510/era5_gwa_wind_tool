@@ -1840,6 +1840,27 @@ if "aep_df" in st.session_state:
         _aep_tz_sfx = (
             f"UTC{_tz_offset_str(_df_aep.index)}" if tz_display != "UTC" else "UTC"
         )
+        _aep_header_lines = [
+            "# ERA5 x GWA Wind Resource Synthesis — AEP time series",
+            "#",
+            f"# Site (input):       {_aep_lat:.4f}N, {_aep_lon:.4f}E",
+            f"# Timezone:           {tz_display} ({_aep_tz_sfx})",
+            f"# Wind record:        {_df_aep.index[0].strftime('%Y-%m-%d')} to {_df_aep.index[-1].strftime('%Y-%m-%d')} ({_aep['n_years']:.1f} yr)",
+            "#",
+            f"# Wind turbine:       {_selected_wtg}",
+            f"# Rated capacity:     {_aep['rated_kw']/1000:.2f} MW (from power curve)",
+            f"# Nameplate capacity: {_nameplate_mw:.1f} MW (scaled)",
+            f"# Wake losses:        {'applied (2D interpolation from wake matrix)' if _apply_wake and _wake_df is not None else 'not applied'}",
+            "#",
+            f"# Gross AEP:          {_energy_str(_aep['gross_aep_mwh'])}",
+            f"# Net AEP:            {_energy_str(_aep['net_aep_mwh'])}",
+            f"# Mean wake loss:     {_aep['mean_wake_pct']:.1f} %",
+            f"# Capacity factor:    {_aep['capacity_factor']*100:.1f} %",
+            "#",
+            "# INDICATIVE ONLY — wind speeds are synthesised from ERA5 + GWA, not measured.",
+            "#",
+        ]
+        _aep_file_header = "\n".join(_aep_header_lines) + "\n"
         _aep_out = pd.DataFrame(
             {
                 "wind_speed_ms": _ws_aep.round(1),
@@ -1856,7 +1877,7 @@ if "aep_df" in st.session_state:
         )
         st.download_button(
             label="Download AEP time series (CSV)",
-            data=_aep_out.to_csv().encode(),
+            data=(_aep_file_header + _aep_out.to_csv()).encode(),
             file_name=_aep_fname,
             mime="text/csv",
             use_container_width=True,
