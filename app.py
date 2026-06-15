@@ -1233,21 +1233,15 @@ if run_btn:
 
 The per-hour σᵤ at 150 m is estimated from the ERA5 gust factor at 10 m:
 
-$$TI_{{10m}} = \\frac{{V_{{gust}}/V_{{10m}} - 1}}{{3.5}}, \\quad
-  TI_{{150m}} = TI_{{10m}} \\times \\left(\\frac{{10}}{{150}}\\right)^{{0.11}}$$
+$$TI_{{10m}} = \\frac{{V_{{gust}}/V_{{10m}} - 1}}{{3.5}}$$
 
-The standard deviation for {res_label} *mean* output is then reduced from
-instantaneous TI using the ratio of the integral time scale (≈ 350 s at 150 m)
-to the averaging period ({si['resolution_min'] * 60} s):
+$$TI_{{150m}} = TI_{{10m}} \\times \\left(\\frac{{10}}{{150}}\\right)^{{0.11}}$$
 
-$$\\sigma_{{\\text{{{res_label}}}}} = TI_{{150m}} \\times V_{{150m}} \\times
-  \\sqrt{{T_{{int}} / T_{{avg}}}} = \\times {si['spectral_factor']:.2f}\\; \\text{{of instantaneous}}$$
+The standard deviation for {res_label} *mean* output is reduced from instantaneous TI using the ratio of the integral time scale (≈ 350 s at 150 m) to the averaging period ({si['resolution_min'] * 60} s):
 
-A **continuous AR(1) process** is then generated at {res_label} timesteps across
-the full 10-year record. The AR(1) coefficient (φ = {si['phi_sub']:.3f} per {si['resolution_min']}-min step)
-is derived from the hourly autocorrelation assuming a continuous-time
-Ornstein-Uhlenbeck process. Finally, each hourly block's noise is
-mean-corrected to exactly preserve the ERA5 hourly means.
+$$\\sigma_{{\\text{{{res_label}}}}} = TI_{{150m}} \\times V_{{150m}} \\times \\sqrt{{T_{{int}} / T_{{avg}}}} \\approx {si['spectral_factor']:.2f} \\times \\sigma_{{\\text{{instantaneous}}}}$$
+
+A **continuous AR(1) process** is then generated at {res_label} timesteps across the full record. The AR(1) coefficient (φ = {si['phi_sub']:.3f} per {si['resolution_min']}-min step) is derived from the hourly autocorrelation assuming a continuous-time Ornstein-Uhlenbeck process. Each hourly block's noise is mean-corrected to exactly preserve the ERA5 hourly means.
                     """
                 )
 
@@ -1315,22 +1309,20 @@ mean-corrected to exactly preserve the ERA5 hourly means.
                 _gwa50_eq = f"""
 **GWA 50→150 m (supplementary):**
 
-$$\\alpha_{{50\\text{{-}}150}} = \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_50']:.2f})}}{{\\ln(150/50)}}
-= {meta['alpha_50_150']:.3f}$$
+$$\\alpha_{{50\\text{{-}}150}} = \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_50']:.2f})}}{{\\ln(150/50)}} = {meta['alpha_50_150']:.3f}$$
 
 This spans a wider height range and tends to be closer to the standard wind industry
 value of ~0.2. It is shown for reference only — the 100→150 m α is used for extrapolation
 because it most accurately represents the shear in the layer we are extrapolating across.
 """
+            _diurnal_signal = "low" if (alpha_max - alpha_min) < 0.05 else "moderate" if (alpha_max - alpha_min) < 0.15 else "strong"
             st.markdown(
                 f"""
 The shear exponent α is **diurnal** — it varies hour-by-hour, not a single constant.
 
 **Step 1 — Mean magnitude from GWA (100→150 m)**
 
-$$\\alpha_{{\\text{{mean}}}} = \\frac{{\\ln(V_{{150}}/V_{{100}})}}{{\\ln(150/100)}}
-= \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_100']:.2f})}}{{\\ln(1.5)}}
-= {meta['alpha_mean']:.3f}$$
+$$\\alpha_{{\\text{{mean}}}} = \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_100']:.2f})}}{{\\ln(1.5)}} = {meta['alpha_mean']:.3f}$$
 {_gwa50_eq}
 **Step 2 — Diurnal pattern from ERA5**
 The hourly shape of α is inferred from ERA5 10m/100m ratios — stable nights produce
@@ -1339,12 +1331,9 @@ mean equals α_mean from Step 1.
 
 **Result** — every hourly record extrapolated with its own hour-specific α:
 
-$$V_{{150}}(t) = V_{{100}}(t) \\times \\left(\\frac{{150}}{{100}}\\right)^{{\\alpha(h)}}
-\\quad h = \\text{{hour of day ({tz_display})}}$$
+$$V_{{150}}(t) = V_{{100}}(t) \\times \\left(\\frac{{150}}{{100}}\\right)^{{\\alpha(h)}}, \\quad h = \\text{{hour of day ({tz_display})}}$$
 
-Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({
-"low" if (alpha_max - alpha_min) < 0.05 else "moderate" if (alpha_max - alpha_min) < 0.15 else "strong"
-} signal).
+Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal).
                 """
             )
 
