@@ -1034,16 +1034,16 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
             if _missing_cols:
                 st.error(f"Missing required columns: {', '.join(_missing_cols)}")
             else:
-                _has_wtg = "wtg_model" in _bdf_raw.columns
+                _has_wtg = "turbine_type" in _bdf_raw.columns
                 _has_cap = "nameplate_mw" in _bdf_raw.columns
                 _has_aep = _has_wtg and _has_cap
-                _has_hh_col = "hub_height_m" in _bdf_raw.columns
+                _has_hh_col = "hub_height" in _bdf_raw.columns
 
                 _keep_cols = ["site_name", "latitude", "longitude"]
                 if _has_hh_col:
-                    _keep_cols.append("hub_height_m")
+                    _keep_cols.append("hub_height")
                 if _has_wtg:
-                    _keep_cols.append("wtg_model")
+                    _keep_cols.append("turbine_type")
                 if _has_cap:
                     _keep_cols.append("nameplate_mw")
 
@@ -1060,13 +1060,13 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
 
                 if _has_aep:
                     _unknown_wtgs = sorted({
-                        str(r["wtg_model"]).strip()
+                        str(r["turbine_type"]).strip()
                         for _, r in _bdf.iterrows()
-                        if pd.notna(r.get("wtg_model")) and str(r["wtg_model"]).strip() not in _b_pc_df.columns
+                        if pd.notna(r.get("turbine_type")) and str(r["turbine_type"]).strip() not in _b_pc_df.columns
                     })
                     if _unknown_wtgs:
                         st.warning(
-                            f"Unknown WTG model(s): **{', '.join(_unknown_wtgs)}**. "
+                            f"Unknown turbine type(s): **{', '.join(_unknown_wtgs)}**. "
                             f"Available: {', '.join(_b_pc_df.columns)}. AEP skipped for those rows."
                         )
 
@@ -1090,7 +1090,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                             _prog.progress(_bi / len(_bdf), text=f"Processing {_bname} ({_bi + 1}/{len(_bdf)})…")
 
                             try:
-                                _b_hub_h = float(_brow["hub_height_m"]) if _has_hh_col and pd.notna(_brow.get("hub_height_m")) else float(hub_height)
+                                _b_hub_h = float(_brow["hub_height"]) if _has_hh_col and pd.notna(_brow.get("hub_height")) else float(hub_height)
                                 _b_hh_int = int(_b_hub_h)
                                 _b_era5, _b_elat, _b_elon = fetch_era5(_blat, _blon, _START_YEAR, _END_YEAR)
                                 _b_rough, _ = fetch_site_roughness(_blat, _blon)
@@ -1146,7 +1146,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
 
                                 # ── AEP CSV (if wtg_model + nameplate_mw provided) ──────────────
                                 _sum_aep: dict = {}
-                                _b_wtg = str(_brow.get("wtg_model", "")).strip() if _has_aep else ""
+                                _b_wtg = str(_brow.get("turbine_type", "")).strip() if _has_aep else ""
                                 _b_cap_raw = _brow.get("nameplate_mw") if _has_aep else None
 
                                 if (
