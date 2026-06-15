@@ -851,20 +851,154 @@ st.markdown(f"""
 
 with st.expander("About this tool"):
     st.markdown("""
-This tool synthesises a long-term hourly wind speed time series at **150 m hub height**
-for any onshore location. It combines two complementary data sources:
+This tool produces a long-term hourly (or sub-hourly) wind speed time series at a
+user-specified hub height for any onshore location, by fusing two complementary datasets:
+**ERA5 reanalysis** for temporal variability and **Global Wind Atlas (GWA)** for local
+spatial accuracy. The pipeline is described in full below.
 
-- **[ERA5](https://open-meteo.com)** reanalysis (~28 km grid) — provides realistic
-  temporal variability: storms, seasonal cycles, diurnal patterns.
-- **[Global Wind Atlas](https://globalwindatlas.info)** (250 m grid) — provides local
-  spatial accuracy, encoding terrain and roughness effects through Weibull statistics.
+---
 
-A Weibull quantile transform is applied so the final time series matches GWA's
-locally-calibrated speed distribution, while preserving ERA5's hour-by-hour sequence.
-Sub-hourly output (30-min / 10-min) is stochastically disaggregated via AR(1) and is
-synthetic — not a real measurement record.
+### Data Sources
 
-> **Onshore use only.** Offshore or open-ocean sites are not supported.
+**ERA5 — temporal backbone**
+
+ERA5 is the European Centre for Medium-Range Weather Forecasts (ECMWF) global atmospheric
+reanalysis, covering 1940 to near-present at ~28 km horizontal resolution and 1-hour
+timesteps. It is accessed here via the [Open-Meteo archive API](https://open-meteo.com),
+which returns wind speed at **10 m** and **100 m** above ground level for a single grid
+node nearest to the input site. ERA5 captures the full temporal structure of the wind
+climate — inter-annual variability, seasonal cycles, storm events, diurnal patterns, and
+calm periods — but its coarse resolution means it cannot represent local terrain channelling,
+coastal effects, or roughness changes at the sub-kilometre scale. ERA5 wind speeds are
+therefore systematically biased relative to what a mast or turbine at the site would
+actually experience.
+
+**Global Wind Atlas (GWA) — spatial calibration**
+
+The [Global Wind Atlas](https://globalwindatlas.info) is produced by the Technical
+University of Denmark (DTU) using WAsP mesoscale modelling driven by ERA5, downscaled to a
+**250 m grid**. At each grid point GWA provides Weibull scale (A) and shape (k) parameters
+at multiple heights (typically 10, 50, 100, 150, 200 m) for each of 12 wind direction
+sectors, as well as sector frequencies. These statistics encode the effects of local terrain,
+land cover, and roughness at much finer resolution than ERA5. Critically, GWA Weibull
+parameters represent the *long-term mean* wind climate at the site — they have no temporal
+dimension, but they are far more spatially accurate than ERA5 alone.
+
+---
+
+### Processing Pipeline
+
+**Step 1 — Height extrapolation: ERA5 100 m → hub height**
+
+ERA5 provides wind at 100 m. To reach the hub height (default 150 m, user-adjustable), a
+**power-law extrapolation** is applied:
+
+$$V_{hub}(t) = V_{100}(t) \\times \\left(\\frac{h_{hub}}{100}\\right)^{\\alpha(h)}$$
+
+The shear exponent α is not treated as a single constant — it is computed **hour-by-hour**
+to capture the diurnal stability cycle:
+
+- **Magnitude:** The long-term mean α is anchored to GWA. Specifically, the GWA mean wind
+  speeds at 100 m and hub height (log-linearly interpolated from the GWC Weibull parameters
+  at available heights) give: α_mean = ln(V_hub_GWA / V_100_GWA) / ln(h_hub / 100).
+  This ensures the extrapolated mean matches GWA's locally-calibrated estimate of shear.
+
+- **Diurnal shape:** The *hour-of-day pattern* of α is derived from the ERA5 10 m / 100 m
+  wind ratio across the full record. During stable nocturnal conditions the boundary layer
+  is stratified and shear is strong (high α); during the convective daytime mixing reduces
+  shear (low α). This 24-hour profile is normalised so its mean equals α_mean, preserving
+  both the physically correct diurnal shape and the GWA-calibrated magnitude.
+
+- **Limitation:** The diurnal pattern is derived from the 10–100 m ERA5 layer, which may
+  not perfectly represent shear in the 100 m–hub height layer, particularly for very tall
+  turbines. At 100 m hub height the extrapolation step is skipped entirely.
+
+**Step 2 — Weibull quantile transform: bias correction to GWA**
+
+After height extrapolation, the ERA5-derived distribution at hub height will still differ
+from GWA because of ERA5's spatial resolution bias. A **Weibull quantile transform**
+re-shapes the ERA5 distribution to match GWA's locally-calibrated Weibull:
+
+$$V^*(t) = A_{GWA} \\times \\left(\\frac{V_{hub}(t)}{A_{ERA5}}\\right)^{k_{ERA5}/k_{GWA}}$$
+
+where A_ERA5 and k_ERA5 are fitted to the ERA5 hub-height series, and A_GWA and k_GWA come
+from the GWA grid node (interpolated to hub height from the GWC file). This transform is
+**rank-preserving**: the hour-by-hour sequence, storm timing, and seasonal patterns are all
+unchanged — only the speed distribution is reshaped to match GWA. The result is a time
+series that has ERA5's temporal fidelity and GWA's spatial accuracy.
+
+**Roughness class selection:** The GWA GWC file contains Weibull parameters for multiple
+roughness classes (0.0, 0.03, 0.1, 0.4, 3.0 m). The tool queries OpenStreetMap within
+500 m of the site to determine whether the point is over water, beach/bare ground, or
+general land, then selects the closest matching roughness class. This avoids the large
+positive bias (up to ~25%) that would result from inadvertently using the sea-surface
+roughness class (r = 0.0) for a land site.
+
+---
+
+### Sub-hourly Disaggregation (optional)
+
+When 30-min or 10-min output is selected, hourly ERA5+GWA values are **stochastically
+disaggregated** to produce a synthetic sub-hourly time series. This is a plausible
+realisation of what the wind could have done within each hour — it is explicitly *not* the
+real historical record and is labelled accordingly.
+
+**Turbulence intensity (TI) at hub height**
+
+Per-hour TI is estimated from the ERA5 gust factor at 10 m:
+
+$$TI_{10m} = \\frac{V_{gust} / V_{10m} - 1}{3.5}$$
+
+TI decreases with height following a standard power law:
+
+$$TI_{hub} = TI_{10m} \\times \\left(\\frac{10}{h_{hub}}\\right)^{0.11}$$
+
+When ERA5 gust data is unavailable, a fallback TI profile based on mean wind speed is used
+(higher TI at low speeds, lower at high speeds, following IEC 61400-1 Class B behaviour).
+
+**Standard deviation for sub-hourly means**
+
+Instantaneous TI gives the standard deviation of instantaneous wind speed fluctuations.
+For a *mean* over an averaging period T_avg, the variance is reduced by the ratio of the
+integral time scale T_int to T_avg (von Kármán spectral theory):
+
+$$\\sigma_{T_{avg}} = TI_{hub} \\times V_{hub} \\times \\sqrt{T_{int} / T_{avg}}$$
+
+where T_int ≈ 350 s represents the integral length scale at hub height divided by a
+typical wind speed. For 30-min means this gives a spectral reduction factor of ~0.24;
+for 10-min means ~0.42.
+
+**AR(1) process**
+
+Sub-hourly wind speed values are generated using a first-order autoregressive (AR(1))
+process — a discrete-time approximation to the Ornstein-Uhlenbeck continuous-time
+stochastic process. The AR(1) coefficient φ per sub-hourly timestep is derived from the
+ERA5 hourly autocorrelation assuming exponential decay: φ = exp(−Δt / T_int). Gaussian
+noise scaled to σ_{T_avg} is added at each step. Each hourly block is then mean-corrected
+so that the sub-hourly values average exactly to the ERA5+GWA hourly value — there is no
+bias introduced by disaggregation.
+
+---
+
+### Limitations and appropriate use
+
+- **Not a measured record.** Output is synthesised from modelled data. Uncertainty is
+  greater than for a site-specific mast measurement campaign.
+- **ERA5 grid spacing ~28 km.** Local terrain effects (ridgelines, valleys, coastal
+  gradients) within this radius are not captured by ERA5 and only partially captured by GWA.
+- **GWA is a long-term climatology.** The GWA Weibull parameters represent a multi-decadal
+  mean; they have no inter-annual variability of their own. Year-to-year variation in the
+  output comes entirely from ERA5.
+- **Diurnal shear uses the 10–100 m ERA5 layer.** At hub heights well above 100 m the
+  actual diurnal shear profile may differ from this proxy.
+- **Sub-hourly output is synthetic.** Each run produces one plausible realisation. Do not
+  treat it as a real historical record or use it for fatigue-load analysis without
+  understanding this limitation.
+- **Onshore use only.** The roughness-class selection and GWA terrain modelling are not
+  designed for offshore environments.
+
+> Results are indicative and should be used to inform — not replace — site-specific
+> measurement campaigns and bankable wind resource assessments.
     """)
 
 # ── Session state ─────────────────────────────────────────────────────────────
