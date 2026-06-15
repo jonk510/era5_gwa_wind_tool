@@ -979,39 +979,68 @@ res_label = resolution.replace(" (fake)", "")
 with st.expander("📋 Batch — upload a site list to generate multiple time series"):
     st.markdown(
         "Upload an **Excel or CSV** with columns `site_name`, `latitude`, `longitude` "
-        "(WGS84 decimal degrees). ERA5 period and resolution are taken from the sidebar."
+        "(WGS84 decimal degrees). Add `wtg_model` and `nameplate_mw` columns to also "
+        "generate AEP outputs per site. ERA5 period and resolution are taken from the sidebar."
     )
     _bf = st.file_uploader("Site list", type=["xlsx", "csv"], label_visibility="collapsed")
 
     if _bf is not None:
-        # Clear previous results when a new file is uploaded
         if st.session_state.get("_batch_fname") != _bf.name:
             st.session_state.pop("batch_zip", None)
             st.session_state["_batch_fname"] = _bf.name
 
         try:
-            _bdf = (
+            _bdf_raw = (
                 pd.read_csv(_bf) if _bf.name.lower().endswith(".csv")
                 else pd.read_excel(_bf)
             )
-            _bdf.columns = [str(c).strip().lower() for c in _bdf.columns]
-            if "site_name" not in _bdf.columns:
-                _bdf.insert(0, "site_name", [f"Site_{i+1}" for i in range(len(_bdf))])
-            _missing_cols = [c for c in ["latitude", "longitude"] if c not in _bdf.columns]
+            _bdf_raw.columns = [str(c).strip().lower() for c in _bdf_raw.columns]
+            if "site_name" not in _bdf_raw.columns:
+                _bdf_raw.insert(0, "site_name", [f"Site_{i+1}" for i in range(len(_bdf_raw))])
 
+            _missing_cols = [c for c in ["latitude", "longitude"] if c not in _bdf_raw.columns]
             if _missing_cols:
                 st.error(f"Missing required columns: {', '.join(_missing_cols)}")
             else:
-                _bdf = _bdf[["site_name", "latitude", "longitude"]].dropna().reset_index(drop=True)
+                _has_wtg = "wtg_model" in _bdf_raw.columns
+                _has_cap = "nameplate_mw" in _bdf_raw.columns
+                _has_aep = _has_wtg and _has_cap
+
+                _keep_cols = ["site_name", "latitude", "longitude"]
+                if _has_wtg:
+                    _keep_cols.append("wtg_model")
+                if _has_cap:
+                    _keep_cols.append("nameplate_mw")
+
+                _bdf = _bdf_raw[_keep_cols].dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
                 st.dataframe(_bdf, use_container_width=True, hide_index=True)
+
+                # Load and validate power curves if AEP columns present
+                _b_pc_df = load_power_curves() if _has_aep else None
+                _b_wake_df = load_wake_matrix() if _has_aep else None
+
+                if _has_aep and _b_pc_df is None:
+                    st.warning("AEP columns detected but `data/power_curves.xlsx` not found — AEP will be skipped.")
+                    _has_aep = False
+
+                if _has_aep:
+                    _unknown_wtgs = sorted({
+                        str(r["wtg_model"]).strip()
+                        for _, r in _bdf.iterrows()
+                        if pd.notna(r.get("wtg_model")) and str(r["wtg_model"]).strip() not in _b_pc_df.columns
+                    })
+                    if _unknown_wtgs:
+                        st.warning(
+                            f"Unknown WTG model(s): **{', '.join(_unknown_wtgs)}**. "
+                            f"Available: {', '.join(_b_pc_df.columns)}. AEP skipped for those rows."
+                        )
+
                 st.caption(
-                    f"{len(_bdf)} sites · ERA5 {_START_YEAR}–{_END_YEAR} · {res_label} · "
-                    f"roughness auto-detected from OSM"
+                    f"{len(_bdf)} sites · ERA5 {_START_YEAR}–{_END_YEAR} · {res_label}"
+                    + (" · AEP enabled (wind + AEP CSV per site)" if _has_aep else "")
                 )
 
-                _batch_go = st.button(
-                    "🚀 Process All Sites", type="primary", use_container_width=True,
-                )
+                _batch_go = st.button("🚀 Process All Sites", type="primary", use_container_width=True)
 
                 if _batch_go:
                     _zip_buf = io.BytesIO()
@@ -1034,7 +1063,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                 _b_df, _b_meta = run_pipeline(_b_df_era5, _b_gwc, _b_heights)
                                 _b_tz_sfx = f"UTC{_tz_offset_str(_b_df.index)}" if _b_tz_disp != "UTC" else "UTC"
 
-                                # Metadata header (matches single-site CSV format)
+                                # ── Wind CSV ───────────────────────────────────────────────────────
                                 _b_hdr = "\n".join([
                                     f"# ERA5 x GWA Wind Resource Synthesis — {_bname}",
                                     "#",
@@ -1054,7 +1083,6 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     "#",
                                 ]) + "\n"
 
-                                # Time series data
                                 _bcols = ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
                                 _bcnames = ["era5_ws_100m_ms", "era5_ws_150m_extrap_ms", "gwa_corrected_ws_150m_ms"]
                                 if "wd_100m" in _b_df.columns:
@@ -1071,9 +1099,71 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _bdl["era5_wd_100m_deg"] = _bdl["era5_wd_100m_deg"].round(0).astype(int)
 
                                 _zf.writestr(
-                                    f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}.csv",
+                                    f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}_wind.csv",
                                     (_b_hdr + _bdl.to_csv()).encode(),
                                 )
+
+                                # ── AEP CSV (if wtg_model + nameplate_mw provided) ──────────────
+                                _sum_aep: dict = {}
+                                _b_wtg = str(_brow.get("wtg_model", "")).strip() if _has_aep else ""
+                                _b_cap_raw = _brow.get("nameplate_mw") if _has_aep else None
+
+                                if (
+                                    _has_aep
+                                    and _b_wtg in _b_pc_df.columns
+                                    and pd.notna(_b_cap_raw)
+                                ):
+                                    _b_cap = float(_b_cap_raw)
+                                    _b_ws_aep = _b_df["ws_150m_corrected"].dropna()
+                                    _b_aep = calc_aep(_b_ws_aep, _b_pc_df, _b_wtg, _b_cap, _b_wake_df)
+
+                                    def _b_es(mwh: float) -> str:
+                                        return f"{mwh/1000:.2f} GWh/yr" if mwh >= 1000 else f"{mwh:.0f} MWh/yr"
+
+                                    _b_aep_hdr = "\n".join([
+                                        f"# ERA5 x GWA Wind Resource Synthesis — AEP — {_bname}",
+                                        "#",
+                                        f"# Site:               {_bname}",
+                                        f"# Coordinates:        {_blat:.4f}N, {_blon:.4f}E",
+                                        f"# Timezone:           {_b_tz_disp} ({_b_tz_sfx})",
+                                        f"# Wind record:        {_b_df.index[0].strftime('%Y-%m-%d')} to {_b_df.index[-1].strftime('%Y-%m-%d')} ({_b_aep['n_years']:.1f} yr)",
+                                        "#",
+                                        f"# Wind turbine:       {_b_wtg}",
+                                        f"# Rated capacity:     {_b_aep['rated_kw']/1000:.2f} MW (from power curve)",
+                                        f"# Nameplate capacity: {_b_cap:.1f} MW (scaled)",
+                                        f"# Wake losses:        {'applied' if _b_wake_df is not None else 'not applied'}",
+                                        "#",
+                                        f"# Gross AEP:          {_b_es(_b_aep['gross_aep_mwh'])}",
+                                        f"# Net AEP:            {_b_es(_b_aep['net_aep_mwh'])}",
+                                        f"# Mean wake loss:     {_b_aep['mean_wake_pct']:.1f} %",
+                                        f"# Capacity factor:    {_b_aep['capacity_factor']*100:.1f} %",
+                                        "#",
+                                        "# INDICATIVE ONLY — wind speeds are synthesised from ERA5 + GWA, not measured.",
+                                        "#",
+                                    ]) + "\n"
+
+                                    _b_aep_out = pd.DataFrame({
+                                        "wind_speed_ms": _b_ws_aep.round(1),
+                                        "gross_power_mw": _b_aep["gross_mw_ts"].round(3),
+                                        "wake_loss_pct": _b_aep["wake_pct_ts"].round(2),
+                                        "net_power_mw": _b_aep["net_mw_ts"].round(3),
+                                    })
+                                    _b_aep_out.index = _b_aep_out.index.tz_localize(None)
+                                    _b_aep_out.index.name = f"datetime_{_b_tz_sfx}"
+
+                                    _zf.writestr(
+                                        f"{_bname.replace(' ', '_')}_{_blat:.4f}_{_blon:.4f}_aep.csv",
+                                        (_b_aep_hdr + _b_aep_out.to_csv()).encode(),
+                                    )
+
+                                    _sum_aep = {
+                                        "wtg_model": _b_wtg,
+                                        "nameplate_mw": _b_cap,
+                                        "gross_aep_mwh_yr": round(_b_aep["gross_aep_mwh"], 0),
+                                        "net_aep_mwh_yr": round(_b_aep["net_aep_mwh"], 0),
+                                        "capacity_factor_pct": round(_b_aep["capacity_factor"] * 100, 1),
+                                        "mean_wake_loss_pct": round(_b_aep["mean_wake_pct"], 1),
+                                    }
 
                                 _summary_rows.append({
                                     "site_name": _bname,
@@ -1088,6 +1178,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     "gwa_mean_150m_ms": round(_b_meta["mean_gwa_150"], 2),
                                     "gwa_corrected_mean_150m_ms": round(_b_meta["mean_corrected"], 2),
                                     "wind_shear_alpha_100_150": round(_b_meta["alpha_mean"], 3),
+                                    **_sum_aep,
                                 })
 
                             except Exception as _be:
@@ -1100,7 +1191,6 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                             )
 
                     _prog.progress(1.0, text=f"Done — {len(_summary_rows)} sites processed.")
-
                     if _batch_errors:
                         st.warning(f"{len(_batch_errors)} site(s) failed:\n" + "\n".join(_batch_errors))
 
