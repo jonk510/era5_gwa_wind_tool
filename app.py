@@ -1036,7 +1036,14 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                 st.error(f"Missing required columns: {', '.join(_missing_cols)}")
             else:
                 _has_wtg = "turbine_type" in _bdf_raw.columns
-                _has_cap = "nameplate_mw" in _bdf_raw.columns
+                # Accept "nameplate" or "nameplate_mw"
+                if "nameplate_mw" in _bdf_raw.columns:
+                    _cap_col = "nameplate_mw"
+                elif "nameplate" in _bdf_raw.columns:
+                    _cap_col = "nameplate"
+                else:
+                    _cap_col = None
+                _has_cap = _cap_col is not None
                 _has_aep = _has_wtg
                 _has_hh_col = "hub_height" in _bdf_raw.columns
 
@@ -1046,7 +1053,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                 if _has_wtg:
                     _keep_cols.append("turbine_type")
                 if _has_cap:
-                    _keep_cols.append("nameplate_mw")
+                    _keep_cols.append(_cap_col)
 
                 _bdf = _bdf_raw[_keep_cols].dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
                 st.dataframe(_bdf, use_container_width=True, hide_index=True)
@@ -1153,7 +1160,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
 
                                 if _has_aep and _b_wtg in _b_pc_df.columns:
                                     # nameplate_mw is optional — fall back to rated kW from curve
-                                    _b_cap_raw = _brow.get("nameplate_mw") if _has_cap else None
+                                    _b_cap_raw = _brow.get(_cap_col) if _has_cap else None
                                     if _b_cap_raw is None or pd.isna(_b_cap_raw):
                                         _b_cap = float(_b_pc_df[_b_wtg].max()) / 1000.0
                                     else:
