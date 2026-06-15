@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .streamlit/secrets.toml
 .env
+.DS_Store
+data/.DS_Store
+app_backup_*.py
+data/Copy of *
+data/~$*
+data/test input.xlsx

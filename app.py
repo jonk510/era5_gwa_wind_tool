@@ -24,6 +24,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from pyproj import Transformer
+from report_gen import generate_pdf_report
 from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import brentq
 from scipy.signal import lfilter
@@ -242,9 +243,9 @@ def parse_gwc(text, ref_roughness: float = 0.1):
 @st.cache_data(show_spinner=False)
 def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
     """
-    Fetch hourly ERA5 wind at 10m and 100m from Open-Meteo for the given year range.
-    Returns (df, era5_lat, era5_lon) — the lat/lon are the actual ERA5 grid node
-    coordinates used, which may differ from the input by up to ~0.125°.
+    Fetch hourly ERA5 wind + 2 m temperature from Open-Meteo for the given year range.
+    Returns (df, era5_lat, era5_lon, elevation) — lat/lon are the actual ERA5 grid node
+    coordinates; elevation (m ASL) is the site elevation reported by Open-Meteo.
     """
     r = requests.get(
         OPENMETEO_URL,
@@ -253,7 +254,7 @@ def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
             "longitude": lon,
             "start_date": f"{start_year}-01-01",
             "end_date": f"{end_year}-12-31",
-            "hourly": "wind_speed_100m,wind_speed_10m,wind_gusts_10m,wind_direction_100m",
+            "hourly": "wind_speed_100m,wind_speed_10m,wind_gusts_10m,wind_direction_100m,temperature_2m",
             "wind_speed_unit": "ms",
             "timezone": "UTC",
         },
@@ -263,16 +264,18 @@ def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
     d = r.json()
     era5_lat = d.get("latitude", lat)
     era5_lon = d.get("longitude", lon)
+    elevation = float(d.get("elevation", 0.0))
     df = pd.DataFrame(
         {
             "ws_100m": d["hourly"]["wind_speed_100m"],
             "ws_10m": d["hourly"]["wind_speed_10m"],
             "ws_gust_10m": d["hourly"]["wind_gusts_10m"],
             "wd_100m": d["hourly"]["wind_direction_100m"],
+            "temp_2m": d["hourly"]["temperature_2m"],
         },
         index=pd.to_datetime(d["hourly"]["time"]),
     )
-    return df.dropna(), era5_lat, era5_lon
+    return df.dropna(), era5_lat, era5_lon, elevation
 
 
 @st.cache_data(show_spinner=False)
@@ -408,14 +411,28 @@ def calc_aep(
     wtg: str,
     nameplate_mw: float,
     wake_df: pd.DataFrame | None,
+    density_series: pd.Series | None = None,
 ) -> dict:
-    """Apply power curve + optional wake losses to an hourly wind speed series; return AEP stats."""
+    """Apply power curve + optional air-density correction + optional wake losses; return AEP stats.
+
+    Air density correction (IEC method): V_eq = V × (ρ/1.225)^⅓ — equivalent wind speed
+    at standard density is used for power curve lookup. Wake lookup uses actual wind speed.
+    """
     ws_arr = pc_df.index.values.astype(float)
     kw_arr = pc_df[wtg].values.astype(float)
     rated_kw = float(kw_arr.max())
 
     ws_vals = ws.values
-    gross_kw = np.interp(ws_vals, ws_arr, kw_arr, left=0.0, right=rated_kw)
+
+    # Air-density correction: convert actual wind speed to standard-density equivalent
+    if density_series is not None:
+        rho = density_series.reindex(ws.index).fillna(1.225).values
+        ws_eq = ws_vals * (rho / 1.225) ** (1.0 / 3.0)
+    else:
+        rho = np.full(len(ws_vals), 1.225)
+        ws_eq = ws_vals
+
+    gross_kw = np.interp(ws_eq, ws_arr, kw_arr, left=0.0, right=rated_kw)
     gross_mw = gross_kw / rated_kw * nameplate_mw
 
     if wake_df is not None:
@@ -429,7 +446,7 @@ def calc_aep(
             fill_value=None,
         )
         pts = np.column_stack([
-            np.clip(ws_vals, ws_bins.min(), ws_bins.max()),
+            np.clip(ws_vals, ws_bins.min(), ws_bins.max()),  # actual speed for wake
             np.full(len(ws_vals), float(np.clip(nameplate_mw, cap_bins.min(), cap_bins.max()))),
         ])
         wake_pct = interp_fn(pts).clip(0.0, 100.0)
@@ -450,26 +467,28 @@ def calc_aep(
         "gross_mw_ts": pd.Series(gross_mw, index=ws.index),
         "net_mw_ts": pd.Series(net_mw, index=ws.index),
         "wake_pct_ts": pd.Series(wake_pct, index=ws.index),
+        "ws_equiv_ts": pd.Series(ws_eq, index=ws.index),
         "gross_aep_mwh": gross_aep,
         "net_aep_mwh": net_aep,
         "mean_wake_pct": mean_wake,
         "capacity_factor": cf,
         "rated_kw": rated_kw,
         "n_years": n_years,
+        "mean_air_density": float(rho.mean()),
     }
 
 
 # ── Processing pipeline ───────────────────────────────────────────────────────
 
-def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: float = 150.0) -> tuple:
+def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: float = 150.0, elevation: float = 0.0) -> tuple:
     """
     Full processing pipeline for an arbitrary hub height:
-      1. Derive mean-shear alpha from GWA 100m → hub_height means
-         (Weibull A/k interpolated log-linearly between GWC heights).
+      1. Derive mean-shear alpha from GWA 100m → hub_height means.
       2. Build diurnal alpha profile using ERA5 10m/100m shear pattern.
       3. Extrapolate ERA5 100m → hub_height with diurnal alpha.
       4. Fit Weibull to ERA5 hub_height estimate.
       5. Apply Weibull quantile transform to match GWA hub_height Weibull.
+      6. Compute per-timestep air density at hub height from ERA5 T₂ₘ + ISA lapse.
 
     Returns (df, meta). Internal df columns ws_150m_raw / ws_150m_corrected
     always refer to the hub height (the name is historical).
@@ -535,6 +554,18 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
     v = df["ws_150m_raw"].clip(lower=0.01).values
     df["ws_150m_corrected"] = A_gwa_hub * (v / A_era5_150) ** (k_era5_150 / k_gwa_hub)
 
+    # ── Step 6: Air density at hub height ────────────────────────────────────
+    # Hub height above sea level determines both pressure and temperature.
+    # Temperature: ERA5 2 m value extrapolated up to hub using ISA lapse rate.
+    # Pressure: standard barometric formula (ISA, constant lapse to tropopause).
+    h_asl = elevation + hub_height
+    if "temp_2m" in df.columns:
+        T_hub_K = (df["temp_2m"] + 273.15) - 0.0065 * max(0.0, hub_height - 2.0)
+    else:
+        T_hub_K = 288.15 - 0.0065 * h_asl  # ISA fallback when no ERA5 temperature
+    P_hub = 101325.0 * (1.0 - 2.2558e-5 * h_asl) ** 5.2559
+    df["air_density"] = (P_hub / (287.05 * T_hub_K)).clip(0.9, 1.4)
+
     meta = {
         "hub_height": hub_height,
         "h100_used": h100,
@@ -553,6 +584,8 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
         "A_gwa_150": A_gwa_hub,
         "k_gwa_150": k_gwa_hub,
         "gwa_roughness_used": g100.get("roughness"),
+        "mean_air_density": float(df["air_density"].mean()),
+        "site_elevation": elevation,
     }
 
     return df, meta
@@ -841,7 +874,8 @@ st.markdown(f"""
   <p style="font-size:0.7rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase;
             color:#94A3B8; margin:0 0 6px 0;">Wind Resource Tool</p>
   <h1 style="font-size:1.7rem; font-weight:700; color:#0F172A; margin:0; letter-spacing:-0.03em;
-             line-height:1.15;">ERA5 × Global Wind Atlas</h1>
+             line-height:1.15;">Synthetic wind data and Energy time series with wake approximation<br>
+    <span style="font-size:1.1rem; font-weight:600; color:#475569;">(ERA5 × Global Wind Atlas)</span></h1>
   <p style="font-size:0.9rem; color:#64748B; margin:6px 0 0 0; line-height:1.4;">
     ERA5 hourly reanalysis &nbsp;·&nbsp; GWA spatial accuracy &nbsp;·&nbsp;
     <strong style="color:#0F172A;">{st.session_state.get('hub_height', 150):.0f} m</strong> hub height &nbsp;·&nbsp; onshore
@@ -849,7 +883,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-with st.expander("About this tool"):
+with st.expander("About this tool — methodology & pipeline"):
     st.markdown("""
 This tool produces a long-term hourly (or sub-hourly) wind speed time series at a
 user-specified hub height for any onshore location, by fusing two complementary datasets:
@@ -1036,62 +1070,81 @@ _EPSG_OPTIONS = {
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown('<p style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#94A3B8;margin:0.5rem 0 0.3rem 0;">Location</p>', unsafe_allow_html=True)
-
-    crs_choice = st.selectbox(
-        "Coordinate system",
-        options=list(_EPSG_OPTIONS.keys()),
-        index=0,
-        help="Select the coordinate reference system for your input coordinates.",
+    app_mode = st.radio(
+        "Mode",
+        ["Single Site", "Batch"],
+        horizontal=True,
+        help="Single Site: analyse one location interactively.\nBatch: process multiple sites from an uploaded file.",
     )
-    epsg_code = _EPSG_OPTIONS[crs_choice]
-    if crs_choice == "Custom EPSG code":
-        epsg_code = st.number_input("EPSG code", value=32750, min_value=1, max_value=99999, step=1)
-
-    is_projected = epsg_code is not None and epsg_code != "custom"
-
-    if is_projected:
-        easting = st.number_input(
-            "Easting (m)", value=386000.0, step=100.0, format="%.1f",
-        )
-        northing = st.number_input(
-            "Northing (m)", value=6464000.0, step=100.0, format="%.1f",
-        )
-        try:
-            transformer = Transformer.from_crs(
-                f"EPSG:{epsg_code}", "EPSG:4326", always_xy=True
-            )
-            lon, lat = transformer.transform(easting, northing)
-            lat, lon = round(lat, 6), round(lon, 6)
-            st.caption(f"→ WGS84: **{lat:.5f}°N, {lon:.5f}°E**")
-        except Exception as _e:
-            st.error(f"Coordinate conversion failed: {_e}")
-            lat, lon = -31.9505, 115.8605
-    else:
-        lat = st.number_input(
-            "Latitude", min_value=-90.0, max_value=90.0,
-            step=0.0001, format="%.4f", key="lat_input",
-        )
-        lon = st.number_input(
-            "Longitude", min_value=-180.0, max_value=180.0,
-            step=0.0001, format="%.4f", key="lon_input",
-        )
-        st.caption("Or click the map to set location.")
-
-    if (st.session_state["_prev_lat"], st.session_state["_prev_lon"]) != (lat, lon):
-        st.session_state["era5_node"] = None
-        st.session_state["gwa_node"] = None
-        st.session_state["_prev_lat"] = lat
-        st.session_state["_prev_lon"] = lon
-
     st.divider()
-    tz_detected = detect_timezone(lat, lon)
-    use_utc = st.checkbox("Show times in UTC", value=False)
-    tz_display = "UTC" if use_utc else tz_detected
-    st.caption(
-        f"Detected: **{tz_detected}**"
-        + ("  *(UTC override active)*" if use_utc else "")
-    )
+
+    if app_mode == "Single Site":
+        st.markdown('<p style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#94A3B8;margin:0.5rem 0 0.3rem 0;">Location</p>', unsafe_allow_html=True)
+
+        crs_choice = st.selectbox(
+            "Coordinate system",
+            options=list(_EPSG_OPTIONS.keys()),
+            index=0,
+            help="Select the coordinate reference system for your input coordinates.",
+        )
+        epsg_code = _EPSG_OPTIONS[crs_choice]
+        if crs_choice == "Custom EPSG code":
+            epsg_code = st.number_input("EPSG code", value=32750, min_value=1, max_value=99999, step=1)
+
+        is_projected = epsg_code is not None and epsg_code != "custom"
+
+        if is_projected:
+            easting = st.number_input(
+                "Easting (m)", value=386000.0, step=100.0, format="%.1f",
+            )
+            northing = st.number_input(
+                "Northing (m)", value=6464000.0, step=100.0, format="%.1f",
+            )
+            try:
+                transformer = Transformer.from_crs(
+                    f"EPSG:{epsg_code}", "EPSG:4326", always_xy=True
+                )
+                lon, lat = transformer.transform(easting, northing)
+                lat, lon = round(lat, 6), round(lon, 6)
+                st.caption(f"→ WGS84: **{lat:.5f}°N, {lon:.5f}°E**")
+            except Exception as _e:
+                st.error(f"Coordinate conversion failed: {_e}")
+                lat, lon = -31.9505, 115.8605
+        else:
+            lat = st.number_input(
+                "Latitude", min_value=-90.0, max_value=90.0,
+                step=0.0001, format="%.4f", key="lat_input",
+            )
+            lon = st.number_input(
+                "Longitude", min_value=-180.0, max_value=180.0,
+                step=0.0001, format="%.4f", key="lon_input",
+            )
+            st.caption("Or click the map to set location.")
+
+        if (st.session_state["_prev_lat"], st.session_state["_prev_lon"]) != (lat, lon):
+            st.session_state["era5_node"] = None
+            st.session_state["gwa_node"] = None
+            st.session_state["_prev_lat"] = lat
+            st.session_state["_prev_lon"] = lon
+
+        st.divider()
+        tz_detected = detect_timezone(lat, lon)
+        use_utc = st.checkbox("Show times in UTC", value=False)
+        tz_display = "UTC" if use_utc else tz_detected
+        st.caption(
+            f"Detected: **{tz_detected}**"
+            + ("  *(UTC override active)*" if use_utc else "")
+        )
+    else:
+        # Batch mode — location and hub height come from the uploaded file
+        lat, lon = -31.9505, 115.8605
+        crs_choice = "WGS84 (lat/lon)"
+        epsg_code = None
+        is_projected = False
+        tz_detected = "UTC"
+        use_utc = False
+        tz_display = "UTC"
+        st.caption("📋 Location and hub height are read from the batch file. ERA5 period and resolution below apply to all sites.")
 
     st.divider()
     st.markdown('<p style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#94A3B8;margin:0.25rem 0 0.3rem 0;">ERA5 Period</p>', unsafe_allow_html=True)
@@ -1108,10 +1161,16 @@ with st.sidebar:
     st.caption(f"Period: **{start_year}–{end_year}** ({n_years} yr)")
     _START_YEAR, _END_YEAR = start_year, end_year
 
-    st.info(
-        f"**ERA5 period:** {_START_YEAR}–{_END_YEAR}\n\n"
-        f"{n_years} years · hourly · {tz_display}"
-    )
+    if app_mode == "Single Site":
+        st.info(
+            f"**ERA5 period:** {_START_YEAR}–{_END_YEAR}\n\n"
+            f"{n_years} years · hourly · {tz_display}"
+        )
+    else:
+        st.info(
+            f"**ERA5 period:** {_START_YEAR}–{_END_YEAR}\n\n"
+            f"{n_years} years · hourly · timezone auto per site"
+        )
     st.divider()
     st.markdown('<p style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#94A3B8;margin:0.25rem 0 0.3rem 0;">Output Resolution</p>', unsafe_allow_html=True)
     resolution = st.selectbox(
@@ -1133,20 +1192,25 @@ with st.sidebar:
         max_value=300,
         step=10,
         key="hub_height",
-        help="Height for wind speed extrapolation and GWA Weibull correction.",
+        help="Height for wind speed extrapolation and GWA Weibull correction. Used as the default in batch mode when no hub_height column is present.",
     )
     st.divider()
-    run_btn = st.button("🚀  Fetch & Process Data", type="primary", use_container_width=True)
+    if app_mode == "Single Site":
+        run_btn = st.button("🚀  Fetch & Process Data", type="primary", use_container_width=True)
+    else:
+        run_btn = False
 
 # ── Friendly display label (strips "(fake)" for headings) ────────────────────
 res_label = resolution.replace(" (fake)", "")
 
 # ── Batch processing ──────────────────────────────────────────────────────────
-with st.expander("📋 Batch — upload a site list to generate multiple time series"):
+if app_mode == "Batch":
     st.markdown(
         "Upload an **Excel or CSV** with columns `site_name`, `latitude`, `longitude`, "
         "`hub_height`, `turbine_type` (WGS84 decimal degrees). "
-        "Add `nameplate_mw` to scale to a specific park capacity; otherwise rated kW from the power curve is used. "
+        "Add `name_plate` (or `nameplate_mw`) with the **total park capacity in MW** to enable wake loss "
+        "estimation via the wind-speed × nameplate matrix — wake losses require nameplate > 8 MW "
+        "(single-turbine values will yield 0% wake). "
         "ERA5 period and resolution are taken from the sidebar."
     )
     _bf = st.file_uploader("Site list", type=["xlsx", "csv"], label_visibility="collapsed")
@@ -1227,6 +1291,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                     _zip_buf = io.BytesIO()
                     _prog = st.progress(0, text="Starting…")
                     _summary_rows, _batch_errors = [], []
+                    _batch_site_data: dict = {}
 
                     with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
                         for _bi, _brow in _bdf.iterrows():
@@ -1238,21 +1303,28 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                             try:
                                 _b_hub_h = float(_brow["hub_height"]) if _has_hh_col and pd.notna(_brow.get("hub_height")) else float(hub_height)
                                 _b_hh_int = int(_b_hub_h)
-                                _b_era5, _b_elat, _b_elon = fetch_era5(_blat, _blon, _START_YEAR, _END_YEAR)
+                                _b_era5, _b_elat, _b_elon, _b_elevation = fetch_era5(_blat, _blon, _START_YEAR, _END_YEAR)
                                 _b_rough, _ = fetch_site_roughness(_blat, _blon)
                                 _b_gwc, _b_heights, _b_glat, _b_glon = fetch_gwa(_blat, _blon, _b_rough)
                                 _b_tz = detect_timezone(_blat, _blon)
                                 _b_tz_disp = "UTC" if use_utc else _b_tz
                                 _b_df_era5 = localise_df(_b_era5, _b_tz_disp)
-                                _b_df, _b_meta = run_pipeline(_b_df_era5, _b_gwc, _b_heights, hub_height=_b_hub_h)
+                                _b_df, _b_meta = run_pipeline(_b_df_era5, _b_gwc, _b_heights, hub_height=_b_hub_h, elevation=_b_elevation)
                                 _b_tz_sfx = f"UTC{_tz_offset_str(_b_df.index)}" if _b_tz_disp != "UTC" else "UTC"
+
+                                # Sub-hourly disaggregation (mirrors single-site behaviour)
+                                _b_sub_df = None
+                                if res_label != "Hourly":
+                                    _b_res_min = int(res_label.split("-")[0])
+                                    _b_sub_df, _ = disaggregate_subhourly(_b_df, _b_res_min)
 
                                 # ── Wind CSV ───────────────────────────────────────────────────────
                                 _b_hdr = "\n".join([
-                                    f"# ERA5 x GWA Wind Resource Synthesis — {_bname}",
+                                    f"# ERA5 x GWA Wind Resource Synthesis - {_bname}",
                                     "#",
                                     f"# Site:               {_bname}",
-                                    f"# Coordinates:        {_blat:.4f}N, {_blon:.4f}E",
+                                    f"# Latitude:           {_blat:.4f}",
+                                    f"# Longitude:          {_blon:.4f}",
                                     f"# ERA5 grid node:     {_b_elat:.4f}N, {_b_elon:.4f}E  (~0.25 deg grid, ~28 km)",
                                     (f"# GWA grid node:      {_b_glat:.4f}N, {_b_glon:.4f}E  (250 m grid)"
                                      if _b_glat else "# GWA grid node:      unknown"),
@@ -1262,29 +1334,51 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     f"# GWA mean @ 100m:    {_b_meta['mean_gwa_100']:.2f} m/s",
                                     f"# GWA mean @ {_b_hh_int}m:    {_b_meta['mean_gwa_150']:.2f} m/s",
                                     f"# GWA-corrected mean: {_b_meta['mean_corrected']:.2f} m/s",
-                                    f"# Wind shear α:       {_b_meta['alpha_mean']:.3f}  (100→{_b_hh_int} m)",
+                                    f"# Wind shear alpha:     {_b_meta['alpha_mean']:.3f}  (100->{_b_hh_int} m)",
                                     "#",
-                                    "# DATA SOURCE:        SYNTHESISED — NOT A MEASUREMENT RECORD",
+                                    "# DATA SOURCE:        SYNTHESISED - NOT A MEASUREMENT RECORD",
                                     "#",
                                 ]) + "\n"
 
                                 _b_col_extrap = f"era5_ws_{_b_hh_int}m_extrap_ms"
                                 _b_col_corr = f"gwa_corrected_ws_{_b_hh_int}m_ms"
-                                _bcols = ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
-                                _bcnames = ["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]
-                                if "wd_100m" in _b_df.columns:
-                                    _bcols.append("wd_100m")
-                                    _bcnames.append("era5_wd_100m_deg")
-                                _bdl = _b_df[_bcols].copy()
-                                _bdl.columns = _bcnames
-                                _bdl.insert(0, "site_name", _bname)
-                                _bdl.index = _bdl.index.tz_localize(None)
-                                _bdl.index.name = f"datetime_{_b_tz_sfx}"
-                                _bdl[["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]] = (
-                                    _bdl[["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]].round(1)
-                                )
-                                if "era5_wd_100m_deg" in _bdl.columns:
-                                    _bdl["era5_wd_100m_deg"] = _bdl["era5_wd_100m_deg"].round(0).astype(int)
+
+                                if _b_sub_df is not None:
+                                    # Sub-hourly: corrected wind at sub-hourly res, hourly direction/density repeated
+                                    _bdl = _b_sub_df[["ws_150m_subhourly"]].copy()
+                                    _bdl.columns = [_b_col_corr]
+                                    _bdl[_b_col_corr] = _bdl[_b_col_corr].round(1)
+                                    if "wd_100m" in _b_df.columns:
+                                        _bdl["era5_wd_100m_deg"] = (
+                                            _b_df["wd_100m"].reindex(_bdl.index, method="ffill").round(0).astype(int)
+                                        )
+                                    if "air_density" in _b_df.columns:
+                                        _bdl["air_density_kg_m3"] = (
+                                            _b_df["air_density"].reindex(_bdl.index, method="ffill").round(4)
+                                        )
+                                    _bdl.index = _bdl.index.tz_localize(None)
+                                    _bdl.index.name = f"datetime_{_b_tz_sfx}"
+                                else:
+                                    # Hourly: all columns
+                                    _bcols = ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
+                                    _bcnames = ["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]
+                                    if "wd_100m" in _b_df.columns:
+                                        _bcols.append("wd_100m")
+                                        _bcnames.append("era5_wd_100m_deg")
+                                    if "air_density" in _b_df.columns:
+                                        _bcols.append("air_density")
+                                        _bcnames.append("air_density_kg_m3")
+                                    _bdl = _b_df[_bcols].copy()
+                                    _bdl.columns = _bcnames
+                                    _bdl.index = _bdl.index.tz_localize(None)
+                                    _bdl.index.name = f"datetime_{_b_tz_sfx}"
+                                    _bdl[["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]] = (
+                                        _bdl[["era5_ws_100m_ms", _b_col_extrap, _b_col_corr]].round(1)
+                                    )
+                                    if "era5_wd_100m_deg" in _bdl.columns:
+                                        _bdl["era5_wd_100m_deg"] = _bdl["era5_wd_100m_deg"].round(0).astype(int)
+                                    if "air_density_kg_m3" in _bdl.columns:
+                                        _bdl["air_density_kg_m3"] = _bdl["air_density_kg_m3"].round(4)
 
                                 _zf.writestr(
                                     f"{_bname_safe}_{_blat:.4f}_{_blon:.4f}_wind.csv",
@@ -1293,6 +1387,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
 
                                 # ── AEP CSV (if turbine_type provided) ─────────────────────────
                                 _sum_aep: dict = {}
+                                _b_aep_store = None   # captured for PDF report
                                 _b_wtg = str(_brow.get("turbine_type", "")).strip() if _has_aep else ""
 
                                 if _has_aep and _b_wtg in _b_pc_df.columns:
@@ -1300,40 +1395,69 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     _b_cap_raw = _brow.get(_cap_col) if _has_cap else None
                                     if _b_cap_raw is None or pd.isna(_b_cap_raw):
                                         _b_cap = float(_b_pc_df[_b_wtg].max()) / 1000.0
+                                        _b_cap_note = "fallback: rated kW from power curve (single turbine) — wake losses will be zero; set name_plate to total park MW"
                                     else:
                                         _b_cap = float(_b_cap_raw)
+                                        _b_cap_note = f"from name_plate column"
 
-                                    _b_ws_aep = _b_df["ws_150m_corrected"].dropna()
-                                    _b_aep = calc_aep(_b_ws_aep, _b_pc_df, _b_wtg, _b_cap, _b_wake_df)
+                                    if _b_sub_df is not None:
+                                        _b_ws_aep = _b_sub_df["ws_150m_subhourly"].dropna()
+                                        _b_density = (
+                                            _b_df["air_density"].reindex(_b_ws_aep.index, method="ffill")
+                                            if "air_density" in _b_df.columns else None
+                                        )
+                                    else:
+                                        _b_ws_aep = _b_df["ws_150m_corrected"].dropna()
+                                        _b_density = _b_df["air_density"] if "air_density" in _b_df.columns else None
+                                    _b_aep = calc_aep(_b_ws_aep, _b_pc_df, _b_wtg, _b_cap, _b_wake_df, density_series=_b_density)
+                                    _b_aep_store = {
+                                        "gross_mw": _b_aep["gross_mw_ts"],
+                                        "net_mw":   _b_aep["net_mw_ts"],
+                                        "gross_aep_mwh": _b_aep["gross_aep_mwh"],
+                                        "net_aep_mwh":   _b_aep["net_aep_mwh"],
+                                        "mean_wake_pct": _b_aep["mean_wake_pct"],
+                                        "capacity_factor": _b_aep["capacity_factor"],
+                                        "rated_kw": _b_aep["rated_kw"],
+                                        "n_years": _b_aep["n_years"],
+                                        "mean_air_density": _b_aep["mean_air_density"],
+                                    }
 
                                     def _b_es(mwh: float) -> str:
                                         return f"{mwh/1000:.2f} GWh/yr" if mwh >= 1000 else f"{mwh:.0f} MWh/yr"
 
+                                    _b_wake_note = (
+                                        "not applied (wake_loss_matrix.xlsx missing)" if _b_wake_df is None
+                                        else f"applied — mean {_b_aep['mean_wake_pct']:.1f}%"
+                                        + (" (zero because nameplate ≤ 8 MW — set name_plate to total park MW)" if _b_cap <= 8.0 else "")
+                                    )
+                                    _b_n_yr_display = (_b_df.index[-1] - _b_df.index[0]).days / 365.25
                                     _b_aep_hdr = "\n".join([
-                                        f"# ERA5 x GWA Wind Resource Synthesis — AEP — {_bname}",
+                                        f"# ERA5 x GWA Wind Resource Synthesis - AEP - {_bname}",
                                         "#",
                                         f"# Site:               {_bname}",
-                                        f"# Coordinates:        {_blat:.4f}N, {_blon:.4f}E",
+                                        f"# Latitude:           {_blat:.4f}",
+                                        f"# Longitude:          {_blon:.4f}",
                                         f"# Timezone:           {_b_tz_disp} ({_b_tz_sfx})",
-                                        f"# Wind record:        {_b_df.index[0].strftime('%Y-%m-%d')} to {_b_df.index[-1].strftime('%Y-%m-%d')} ({_b_aep['n_years']:.1f} yr)",
+                                        f"# Wind record:        {_b_df.index[0].strftime('%Y-%m-%d')} to {_b_df.index[-1].strftime('%Y-%m-%d')} ({_b_n_yr_display:.1f} yr)",
                                         "#",
                                         f"# Wind turbine:       {_b_wtg}",
                                         f"# Rated capacity:     {_b_aep['rated_kw']/1000:.2f} MW (from power curve)",
-                                        f"# Nameplate capacity: {_b_cap:.1f} MW (scaled)",
-                                        f"# Wake losses:        {'applied' if _b_wake_df is not None else 'not applied'}",
+                                        f"# Nameplate capacity: {_b_cap:.1f} MW - {_b_cap_note}",
+                                        f"# Wake losses:        {_b_wake_note}",
+                                        f"# Air density:        {_b_aep['mean_air_density']:.4f} kg/m3 mean at hub height (IEC V_eq = V*(rho/1.225)^(1/3) applied)",
                                         "#",
                                         f"# Gross AEP:          {_b_es(_b_aep['gross_aep_mwh'])}",
                                         f"# Net AEP:            {_b_es(_b_aep['net_aep_mwh'])}",
                                         f"# Mean wake loss:     {_b_aep['mean_wake_pct']:.1f} %",
                                         f"# Capacity factor:    {_b_aep['capacity_factor']*100:.1f} %",
                                         "#",
-                                        "# INDICATIVE ONLY — wind speeds are synthesised from ERA5 + GWA, not measured.",
+                                        "# INDICATIVE ONLY - wind speeds are synthesised from ERA5 + GWA, not measured.",
                                         "#",
                                     ]) + "\n"
 
                                     _b_aep_out = pd.DataFrame({
-                                        "site_name": _bname,
                                         "wind_speed_ms": _b_ws_aep.round(1),
+                                        "equiv_wind_speed_ms": _b_aep["ws_equiv_ts"].round(1),
                                         "gross_power_mw": _b_aep["gross_mw_ts"].round(3),
                                         "wake_loss_pct": _b_aep["wake_pct_ts"].round(2),
                                         "net_power_mw": _b_aep["net_mw_ts"].round(3),
@@ -1353,12 +1477,14 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                         "net_aep_mwh_yr": round(_b_aep["net_aep_mwh"], 0),
                                         "capacity_factor_pct": round(_b_aep["capacity_factor"] * 100, 1),
                                         "mean_wake_loss_pct": round(_b_aep["mean_wake_pct"], 1),
+                                        "mean_air_density_kg_m3": round(_b_aep["mean_air_density"], 4),
                                     }
 
                                 _summary_rows.append({
                                     "site_name": _bname,
                                     "latitude": _blat,
                                     "longitude": _blon,
+                                    "elevation_m_asl": round(_b_elevation, 0),
                                     "hub_height_m": _b_hh_int,
                                     "era5_grid_lat": round(_b_elat, 4),
                                     "era5_grid_lon": round(_b_elon, 4),
@@ -1369,8 +1495,27 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                                     "gwa_mean_hub_ms": round(_b_meta["mean_gwa_150"], 2),
                                     "gwa_corrected_mean_hub_ms": round(_b_meta["mean_corrected"], 2),
                                     "wind_shear_alpha": round(_b_meta["alpha_mean"], 3),
+                                    "mean_air_density_kg_m3": round(_b_meta["mean_air_density"], 4),
                                     **_sum_aep,
                                 })
+
+                                # Store data for PDF report (minimum columns needed)
+                                _store_cols = ["ws_150m_raw", "ws_150m_corrected", "ws_100m"]
+                                if "air_density" in _b_df.columns:
+                                    _store_cols.append("air_density")
+                                _batch_site_data[_bname] = {
+                                    "ws_raw":       _b_df["ws_150m_raw"].copy(),
+                                    "ws_corr":      _b_df["ws_150m_corrected"].copy(),
+                                    "ws_100m":      _b_df["ws_100m"].copy(),
+                                    "air_density":  _b_df["air_density"].copy() if "air_density" in _b_df.columns else None,
+                                    "meta":         _b_meta,
+                                    "aep":          _b_aep_store,
+                                    "wtg":          _b_wtg,
+                                    "nameplate_mw": _b_cap if _b_aep_store is not None else None,
+                                    "lat":          _blat,
+                                    "lon":          _blon,
+                                    "elevation":    _b_elevation,
+                                }
 
                             except Exception as _be:
                                 _batch_errors.append(f"{_bname}: {_be}")
@@ -1389,6 +1534,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                     st.session_state["batch_zip_name"] = f"wind_batch_{_START_YEAR}_{_END_YEAR}.zip"
                     st.session_state["batch_n"] = len(_summary_rows)
                     st.session_state["batch_summary"] = _summary_rows
+                    st.session_state["batch_site_data"] = _batch_site_data
 
                 if "batch_zip" in st.session_state:
                     st.download_button(
@@ -1400,6 +1546,33 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                     )
 
                 if "batch_summary" in st.session_state and st.session_state["batch_summary"]:
+                    # ── PDF Report ─────────────────────────────────────────────
+                    if st.button("📄  Generate PDF QA Report", use_container_width=True,
+                                 help="Creates a multi-page PDF with satellite map, charts, tables and methodology"):
+                        with st.spinner("Generating PDF report…"):
+                            try:
+                                _pdf_bytes = generate_pdf_report(
+                                    summary_rows=st.session_state["batch_summary"],
+                                    site_data=st.session_state.get("batch_site_data", {}),
+                                    wake_df=load_wake_matrix(),
+                                    pc_df=load_power_curves(),
+                                    start_year=_START_YEAR,
+                                    end_year=_END_YEAR,
+                                )
+                                st.session_state["batch_pdf"] = _pdf_bytes
+                            except Exception as _pdf_err:
+                                st.error(f"PDF generation failed: {_pdf_err}")
+                                raise
+
+                    if "batch_pdf" in st.session_state:
+                        st.download_button(
+                            label="⬇️  Download PDF Report",
+                            data=st.session_state["batch_pdf"],
+                            file_name=f"wind_assessment_report_{_START_YEAR}_{_END_YEAR}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+
                     _sr = pd.DataFrame(st.session_state["batch_summary"])
 
                     st.markdown("---")
@@ -1464,10 +1637,8 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
         except Exception as _be_outer:
             st.error(f"Could not read file: {_be_outer}")
 
-# ── Map + method description ──────────────────────────────────────────────────
-col_map, col_method = st.columns([3, 2])
-
-with col_map:
+# ── Site location map (full width) ───────────────────────────────────────────
+if app_mode == "Single Site":
     st.markdown('<span class="lbl">Site Location</span>', unsafe_allow_html=True)
     m = folium.Map(location=[lat, lon], zoom_start=9, tiles=ESRI_TILES, attr=ESRI_ATTR)
 
@@ -1548,49 +1719,12 @@ with col_map:
     else:
         st.caption("Click the map to move the site · Fetch & Process Data to show grid nodes.")
 
-with col_method:
-    st.markdown('<span class="lbl">Processing Pipeline</span><p class="sh">How the synthesis works</p>', unsafe_allow_html=True)
-    _hh = st.session_state.get('hub_height', 150)
-    st.markdown(f"""
-    <div class="step">
-      <div class="step-n">1</div>
-      <div>
-        <div class="step-title">ERA5 @ 100 m <span class="tag tag-era5">ERA5</span></div>
-        <div class="step-desc">10-year hourly reanalysis via Open-Meteo (~28 km grid). Real temporal variability — storms, seasons, diurnal cycles.</div>
-      </div>
-    </div>
-    <div class="step">
-      <div class="step-n">2</div>
-      <div>
-        <div class="step-title">Height extrapolation → {_hh:.0f} m <span class="tag tag-era5">ERA5</span><span class="tag tag-gwa">GWA</span></div>
-        <div class="step-desc">Power-law with a diurnal shear exponent α. Shape from ERA5 10m/100m ratio; mean magnitude calibrated to GWA 100m/{_hh:.0f}m shear.</div>
-      </div>
-    </div>
-    <div class="step">
-      <div class="step-n">3</div>
-      <div>
-        <div class="step-title">Weibull correction <span class="tag tag-synth">Synthesised</span></div>
-        <div class="step-desc">Quantile transform morphs the ERA5 distribution to match GWA {_hh:.0f} m Weibull (A, k). Rank order and all temporal patterns are preserved exactly.</div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    with st.expander("Equations"):
-        st.markdown(r"""
-**Height extrapolation:**
-$$V_{150}(t) = V_{100}(t) \times \left(\frac{150}{100}\right)^{\alpha(h)}$$
-
-**Weibull quantile transform:**
-$$V^* = A_{\text{GWA}} \times \left(\frac{V}{A_{\text{ERA5}}}\right)^{k_{\text{ERA5}} / k_{\text{GWA}}}$$
-
-*α(h) varies by hour — stronger at night (stable BL), weaker by day (convective mixing).*
-        """)
 
 # ── Results section ───────────────────────────────────────────────────────────
 if run_btn:
     try:
         with st.spinner(f"Fetching {_END_YEAR - _START_YEAR + 1} years of ERA5 data…"):
-            df_era5_utc, era5_lat, era5_lon = fetch_era5(lat, lon, _START_YEAR, _END_YEAR)
+            df_era5_utc, era5_lat, era5_lon, site_elevation = fetch_era5(lat, lon, _START_YEAR, _END_YEAR)
 
         with st.spinner("Fetching Global Wind Atlas data…"):
             site_roughness, rough_source = fetch_site_roughness(lat, lon)
@@ -1606,7 +1740,11 @@ if run_btn:
         df_era5 = localise_df(df_era5_utc, tz_display)
 
         with st.spinner("Running processing pipeline…"):
-            df, meta = run_pipeline(df_era5, gwc, heights, hub_height=hub_height)
+            df, meta = run_pipeline(df_era5, gwc, heights, hub_height=hub_height, elevation=site_elevation)
+
+        # Persist for PDF report (survives re-renders)
+        st.session_state["site_df"]   = df
+        st.session_state["site_meta"] = meta
 
         tz_label = "UTC" if tz_display == "UTC" else f"{tz_detected} (UTC{_tz_offset_str(df.index)})"
 
@@ -1618,8 +1756,15 @@ if run_btn:
             with st.spinner(f"Disaggregating to {res_label}…"):
                 df_sub, sub_info = disaggregate_subhourly(df, res_min)
 
-        # Persist wind results so the AEP section survives re-renders without re-fetching
-        st.session_state["aep_df"] = df
+        # Persist wind results so the AEP section survives re-renders without re-fetching.
+        # Use sub-hourly df if disaggregation was requested, so the AEP CSV matches the wind CSV resolution.
+        if df_sub is not None:
+            _aep_save = df_sub[["ws_150m_subhourly"]].rename(columns={"ws_150m_subhourly": "ws_150m_corrected"})
+            if "air_density" in df.columns:
+                _aep_save["air_density"] = df["air_density"].reindex(_aep_save.index, method="ffill")
+            st.session_state["aep_df"] = _aep_save
+        else:
+            st.session_state["aep_df"] = df
         st.session_state["aep_lat"] = lat
         st.session_state["aep_lon"] = lon
         st.session_state["aep_hub_height"] = hub_height
@@ -2131,17 +2276,21 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         _era5_node = st.session_state.get("era5_node")
         _gwa_node  = st.session_state.get("gwa_node")
         _header_lines = [
-            "# ERA5 x GWA Wind Resource Synthesis — synthesised time series",
+            "# ERA5 x GWA Wind Resource Synthesis - synthesised time series",
             "#",
-            f"# Site (input):       {lat:.4f}N, {lon:.4f}E",
+            f"# Latitude (input):   {lat:.4f}",
+            f"# Longitude (input):  {lon:.4f}",
             (f"# ERA5 grid node:     {_era5_node[0]:.4f}N, {_era5_node[1]:.4f}E  (~0.25 deg grid, ~28 km)"
              if _era5_node else "# ERA5 grid node:     unknown (fetch data to populate)"),
             (f"# GWA grid node:      {_gwa_node[0]:.4f}N, {_gwa_node[1]:.4f}E  (250 m grid)"
              if _gwa_node else "# GWA grid node:      unknown (fetch data to populate)"),
             f"# Timezone:           {tz_display} ({_tz_suffix})",
             f"# Period:             {_START_YEAR}-01-01 to {_END_YEAR}-12-31",
+            f"# Site elevation:     {meta['site_elevation']:.0f} m ASL",
+            f"# Hub height:         {hub_height:.0f} m AGL  ({meta['site_elevation'] + hub_height:.0f} m ASL)",
+            f"# Mean air density:   {meta['mean_air_density']:.4f} kg/m3 at hub height (ERA5 T2m + ISA lapse, standard: 1.225)",
             "#",
-            "# DATA SOURCE:        SYNTHESISED — NOT A MEASUREMENT RECORD",
+            "# DATA SOURCE:        SYNTHESISED - NOT A MEASUREMENT RECORD",
             "# Wind speeds are derived by combining ERA5 reanalysis (temporal variability)",
             "# with Global Wind Atlas statistics (spatial accuracy via Weibull correction).",
             "# Sub-hourly values (if present) are stochastic disaggregations, not observations.",
@@ -2170,12 +2319,15 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
             )
             dl_fname = f"wind_{_hh_int}m_{res_label}_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
         else:
-            # Hourly: speed columns + wind direction
+            # Hourly: speed columns + wind direction + air density
             cols = ["ws_100m", "ws_150m_raw", "ws_150m_corrected"]
             col_names = ["era5_ws_100m_ms", _col_extrap, _col_corr]
             if _has_wd:
                 cols.append("wd_100m")
                 col_names.append("era5_wd_100m_deg")
+            if "air_density" in df.columns:
+                cols.append("air_density")
+                col_names.append("air_density_kg_m3")
             dl = _prep_index(df[cols])
             dl.columns = col_names
             dl[["era5_ws_100m_ms", _col_extrap, _col_corr]] = (
@@ -2183,6 +2335,8 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
             )
             if _has_wd:
                 dl["era5_wd_100m_deg"] = dl["era5_wd_100m_deg"].round(0).astype(int)
+            if "air_density_kg_m3" in dl.columns:
+                dl["air_density_kg_m3"] = dl["air_density_kg_m3"].round(4)
             csv_bytes = (_file_header + dl.to_csv()).encode()
             dl_label = "Download hourly time series (CSV)"
             dl_caption = (
@@ -2190,14 +2344,11 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
             )
             dl_fname = f"wind_{_hh_int}m_hourly_{lat:.4f}_{lon:.4f}_{_START_YEAR}_{_END_YEAR}.csv"
 
-        st.download_button(
-            label=dl_label,
-            data=csv_bytes,
-            file_name=dl_fname,
-            mime="text/csv",
-            use_container_width=True,
-        )
-        st.caption(dl_caption)
+        # Persist so the download button survives re-renders after clicking it
+        st.session_state["wind_csv"] = {
+            "bytes": csv_bytes, "fname": dl_fname,
+            "label": dl_label, "caption": dl_caption,
+        }
 
     except requests.HTTPError as exc:
         st.error(f"API request failed: {exc}")
@@ -2206,6 +2357,100 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
     except Exception as exc:
         st.error(f"Unexpected error: {exc}")
         raise
+
+# ── Persistent single-site downloads + PDF ────────────────────────────────────
+if "wind_csv" in st.session_state and app_mode == "Single Site":
+    _wcsv = st.session_state["wind_csv"]
+    st.download_button(
+        label=_wcsv["label"],
+        data=_wcsv["bytes"],
+        file_name=_wcsv["fname"],
+        mime="text/csv",
+        use_container_width=True,
+    )
+    st.caption(_wcsv["caption"])
+
+    st.markdown("---")
+
+    if st.button("📄  Generate PDF QA Report", use_container_width=True,
+                 key="ss_pdf_btn",
+                 help="Single-site PDF with wind charts and (if AEP was run) energy results"):
+        _ss_df   = st.session_state.get("site_df")
+        _ss_meta = st.session_state.get("site_meta")
+        _ss_aep  = st.session_state.get("site_aep_results")
+        _ss_lat  = st.session_state.get("aep_lat", lat)
+        _ss_lon  = st.session_state.get("aep_lon", lon)
+        _ss_hub  = int(st.session_state.get("aep_hub_height", hub_height))
+        _ss_name = f"Site ({_ss_lat:.4f}, {_ss_lon:.4f})"
+
+        if _ss_df is not None and _ss_meta is not None:
+            _ss_row = {
+                "site_name":                 _ss_name,
+                "latitude":                  _ss_lat,
+                "longitude":                 _ss_lon,
+                "elevation_m_asl":           _ss_meta.get("site_elevation", 0),
+                "hub_height_m":              _ss_hub,
+                "era5_mean_100m_ms":         round(_ss_meta.get("mean_era5_100", 0), 2),
+                "gwa_mean_100m_ms":          round(_ss_meta.get("mean_gwa_100", 0), 2),
+                "gwa_mean_hub_ms":           round(_ss_meta.get("mean_gwa_150", 0), 2),
+                "gwa_corrected_mean_hub_ms": round(_ss_meta.get("mean_corrected", 0), 2),
+                "wind_shear_alpha":          round(_ss_meta.get("alpha_mean", 0), 3),
+                "mean_air_density_kg_m3":    round(_ss_meta.get("mean_air_density", 1.225), 4),
+            }
+            _ss_entry = {
+                "ws_corr":    _ss_df["ws_150m_corrected"],
+                "ws_raw":     _ss_df["ws_150m_raw"] if "ws_150m_raw" in _ss_df.columns else _ss_df["ws_150m_corrected"],
+                "meta":       _ss_meta,
+                "air_density": _ss_df["air_density"] if "air_density" in _ss_df.columns else None,
+            }
+            if _ss_aep is not None:
+                _ar = _ss_aep["aep"]
+                _ss_row.update({
+                    "gross_aep_mwh_yr":     _ar["gross_aep_mwh"],
+                    "net_aep_mwh_yr":       _ar["net_aep_mwh"],
+                    "turbine_type":         _ss_aep["wtg"],
+                    "nameplate_mw":         _ss_aep["nameplate_mw"],
+                    "mean_wake_loss_pct":   _ar["mean_wake_pct"],
+                    "capacity_factor_pct":  _ar["capacity_factor"] * 100,
+                })
+                _ss_entry.update({
+                    "aep": {
+                        "gross_mw":        _ar["gross_mw_ts"],
+                        "net_mw":          _ar["net_mw_ts"],
+                        "gross_aep_mwh":   _ar["gross_aep_mwh"],
+                        "net_aep_mwh":     _ar["net_aep_mwh"],
+                        "mean_wake_pct":   _ar["mean_wake_pct"],
+                        "capacity_factor": _ar["capacity_factor"],
+                        "rated_kw":        _ar["rated_kw"],
+                    },
+                    "wtg":         _ss_aep["wtg"],
+                    "nameplate_mw": _ss_aep["nameplate_mw"],
+                })
+            with st.spinner("Generating PDF report…"):
+                try:
+                    _ss_pdf_bytes = generate_pdf_report(
+                        summary_rows=[_ss_row],
+                        site_data={_ss_name: _ss_entry},
+                        wake_df=load_wake_matrix(),
+                        pc_df=load_power_curves(),
+                        start_year=_START_YEAR,
+                        end_year=_END_YEAR,
+                    )
+                    st.session_state["single_site_pdf"] = _ss_pdf_bytes
+                except Exception as _e:
+                    st.error(f"PDF generation failed: {_e}")
+                    raise
+        else:
+            st.warning("No wind data in memory — fetch data first.")
+
+    if "single_site_pdf" in st.session_state:
+        st.download_button(
+            label="⬇️  Download PDF Report",
+            data=st.session_state["single_site_pdf"],
+            file_name=f"wind_report_{_START_YEAR}_{_END_YEAR}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
 # ── AEP Calculator ────────────────────────────────────────────────────────────
 if "aep_df" in st.session_state:
@@ -2274,16 +2519,21 @@ if "aep_df" in st.session_state:
 
         # Run AEP calculation
         _ws_aep = _df_aep["ws_150m_corrected"].dropna()
+        _density_aep = _df_aep["air_density"] if "air_density" in _df_aep.columns else None
         _aep = calc_aep(
             _ws_aep, _pc_df, _selected_wtg, _nameplate_mw,
             _wake_df if _apply_wake else None,
+            density_series=_density_aep,
         )
+        st.session_state["site_aep_results"] = {
+            "aep": _aep, "wtg": _selected_wtg, "nameplate_mw": _nameplate_mw,
+        }
 
         # Metrics
         def _energy_str(mwh: float) -> str:
             return f"{mwh / 1000:.2f} GWh/yr" if mwh >= 1000 else f"{mwh:.0f} MWh/yr"
 
-        _am1, _am2, _am3, _am4 = st.columns(4)
+        _am1, _am2, _am3, _am4, _am5 = st.columns(5)
         _am1.metric("Gross AEP", _energy_str(_aep["gross_aep_mwh"]))
         _am2.metric(
             "Net AEP",
@@ -2293,6 +2543,12 @@ if "aep_df" in st.session_state:
         )
         _am3.metric("Capacity Factor", f"{_aep['capacity_factor'] * 100:.1f}%")
         _am4.metric("Rated (from curve)", f"{_aep['rated_kw'] / 1000:.2f} MW")
+        _am5.metric(
+            "Air Density",
+            f"{_aep['mean_air_density']:.4f} kg/m³",
+            delta=f"{(_aep['mean_air_density'] - 1.225) / 1.225 * 100:+.1f}% vs 1.225",
+            delta_color="off",
+        )
 
         st.markdown(
             f'<div class="ann">'
@@ -2338,30 +2594,34 @@ if "aep_df" in st.session_state:
         _aep_tz_sfx = (
             f"UTC{_tz_offset_str(_df_aep.index)}" if tz_display != "UTC" else "UTC"
         )
+        _aep_n_yr = (_df_aep.index[-1] - _df_aep.index[0]).days / 365.25
         _aep_header_lines = [
-            "# ERA5 x GWA Wind Resource Synthesis — AEP time series",
+            "# ERA5 x GWA Wind Resource Synthesis - AEP time series",
             "#",
-            f"# Site (input):       {_aep_lat:.4f}N, {_aep_lon:.4f}E",
+            f"# Latitude (input):   {_aep_lat:.4f}",
+            f"# Longitude (input):  {_aep_lon:.4f}",
             f"# Timezone:           {tz_display} ({_aep_tz_sfx})",
-            f"# Wind record:        {_df_aep.index[0].strftime('%Y-%m-%d')} to {_df_aep.index[-1].strftime('%Y-%m-%d')} ({_aep['n_years']:.1f} yr)",
+            f"# Wind record:        {_df_aep.index[0].strftime('%Y-%m-%d')} to {_df_aep.index[-1].strftime('%Y-%m-%d')} ({_aep_n_yr:.1f} yr)",
             "#",
             f"# Wind turbine:       {_selected_wtg}",
             f"# Rated capacity:     {_aep['rated_kw']/1000:.2f} MW (from power curve)",
             f"# Nameplate capacity: {_nameplate_mw:.1f} MW (scaled)",
             f"# Wake losses:        {'applied (2D interpolation from wake matrix)' if _apply_wake and _wake_df is not None else 'not applied'}",
+            f"# Air density:        {_aep['mean_air_density']:.4f} kg/m3 mean at hub height (IEC V_eq = V*(rho/1.225)^(1/3) applied)",
             "#",
             f"# Gross AEP:          {_energy_str(_aep['gross_aep_mwh'])}",
             f"# Net AEP:            {_energy_str(_aep['net_aep_mwh'])}",
             f"# Mean wake loss:     {_aep['mean_wake_pct']:.1f} %",
             f"# Capacity factor:    {_aep['capacity_factor']*100:.1f} %",
             "#",
-            "# INDICATIVE ONLY — wind speeds are synthesised from ERA5 + GWA, not measured.",
+            "# INDICATIVE ONLY - wind speeds are synthesised from ERA5 + GWA, not measured.",
             "#",
         ]
         _aep_file_header = "\n".join(_aep_header_lines) + "\n"
         _aep_out = pd.DataFrame(
             {
                 "wind_speed_ms": _ws_aep.round(1),
+                "equiv_wind_speed_ms": _aep["ws_equiv_ts"].round(1),
                 "gross_power_mw": _aep["gross_mw_ts"].round(3),
                 "wake_loss_pct": _aep["wake_pct_ts"].round(2),
                 "net_power_mw": _aep["net_mw_ts"].round(3),
@@ -2383,5 +2643,5 @@ if "aep_df" in st.session_state:
         st.caption(
             f"{_selected_wtg} · {_nameplate_mw:.1f} MW nameplate · "
             f"{'Wake-corrected' if _apply_wake and _wake_df is not None else 'No wake correction'} · "
-            f"{_aep['n_years']:.1f}-year record"
+            f"{_aep_n_yr:.1f}-year record"
         )
