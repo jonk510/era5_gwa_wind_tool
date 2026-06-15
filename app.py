@@ -1020,6 +1020,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
     if _bf is not None:
         if st.session_state.get("_batch_fname") != _bf.name:
             st.session_state.pop("batch_zip", None)
+            st.session_state.pop("batch_summary", None)
             st.session_state["_batch_fname"] = _bf.name
 
         try:
@@ -1253,6 +1254,7 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                     st.session_state["batch_zip"] = _zip_buf.getvalue()
                     st.session_state["batch_zip_name"] = f"wind_batch_{_START_YEAR}_{_END_YEAR}.zip"
                     st.session_state["batch_n"] = len(_summary_rows)
+                    st.session_state["batch_summary"] = _summary_rows
 
                 if "batch_zip" in st.session_state:
                     st.download_button(
@@ -1262,6 +1264,68 @@ with st.expander("📋 Batch — upload a site list to generate multiple time se
                         mime="application/zip",
                         use_container_width=True,
                     )
+
+                if "batch_summary" in st.session_state and st.session_state["batch_summary"]:
+                    _sr = pd.DataFrame(st.session_state["batch_summary"])
+
+                    st.markdown("---")
+                    st.markdown("**Results Summary**")
+                    st.dataframe(_sr, use_container_width=True, hide_index=True)
+
+                    # ── Map ────────────────────────────────────────────────────
+                    _mlat = _sr["latitude"].mean()
+                    _mlon = _sr["longitude"].mean()
+                    _bm = folium.Map(location=[_mlat, _mlon], zoom_start=7,
+                                     tiles=ESRI_TILES, attr=ESRI_ATTR)
+
+                    _ws_col = "gwa_corrected_mean_hub_ms"
+                    _ws_vals = _sr[_ws_col].dropna()
+                    _ws_min = _ws_vals.min() if len(_ws_vals) else 0
+                    _ws_max = _ws_vals.max() if len(_ws_vals) else 1
+
+                    for _, _sr_row in _sr.iterrows():
+                        _ws = _sr_row.get(_ws_col)
+                        if pd.isna(_ws) if _ws is not None else True:
+                            _colour = "#94A3B8"
+                        else:
+                            _t = (_ws - _ws_min) / max(_ws_max - _ws_min, 0.01)
+                            r = int(220 - _t * 170)
+                            g = int(80 + _t * 150)
+                            _colour = f"#{r:02x}{g:02x}50"
+
+                        _pop_lines = [
+                            f"<b>{_sr_row['site_name']}</b>",
+                            f"{_sr_row['latitude']:.4f}N, {_sr_row['longitude']:.4f}E",
+                            f"Hub height: {_sr_row.get('hub_height_m', '—')} m",
+                            f"GWA mean @ hub: {_sr_row.get('gwa_mean_hub_ms', '—'):.2f} m/s" if pd.notna(_sr_row.get('gwa_mean_hub_ms')) else "",
+                            f"GWA-corrected: <b>{_ws:.2f} m/s</b>" if _ws is not None and pd.notna(_ws) else "",
+                            f"Shear α: {_sr_row.get('wind_shear_alpha', '—'):.3f}" if pd.notna(_sr_row.get('wind_shear_alpha')) else "",
+                        ]
+                        if pd.notna(_sr_row.get("gross_aep_mwh_yr")):
+                            _pop_lines += [
+                                "—",
+                                f"Turbine: {_sr_row.get('turbine_type', '—')}",
+                                f"Nameplate: {_sr_row.get('nameplate_mw', '—'):.1f} MW",
+                                f"Gross AEP: {_sr_row['gross_aep_mwh_yr']/1000:.1f} GWh/yr",
+                                f"Net AEP: {_sr_row['net_aep_mwh_yr']/1000:.1f} GWh/yr",
+                                f"CF: {_sr_row['capacity_factor_pct']:.1f} %",
+                            ]
+                        _popup_html = "<br>".join(l for l in _pop_lines if l)
+
+                        folium.CircleMarker(
+                            location=[_sr_row["latitude"], _sr_row["longitude"]],
+                            radius=10,
+                            color="white",
+                            weight=1.5,
+                            fill=True,
+                            fill_color=_colour,
+                            fill_opacity=0.9,
+                            tooltip=f"{_sr_row['site_name']} — {_ws:.2f} m/s" if _ws is not None and pd.notna(_ws) else _sr_row['site_name'],
+                            popup=folium.Popup(_popup_html, max_width=240),
+                        ).add_to(_bm)
+
+                    st_folium(_bm, height=420, use_container_width=True,
+                              returned_objects=[], key="batch_map")
 
         except Exception as _be_outer:
             st.error(f"Could not read file: {_be_outer}")
