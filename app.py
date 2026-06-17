@@ -513,6 +513,9 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
     else:
         alpha_mean = np.log(mean_gwa_hub / mean_gwa_100) / log_h_ratio
 
+    _alpha_raw = alpha_mean
+    alpha_mean = max(0.05, min(alpha_mean, 0.60))
+
     # Supplementary: α from ~50m → hub_height (reference only, shown in UI)
     alpha_50_150 = None
     mean_gwa_50 = None
@@ -552,7 +555,11 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
 
     # ── Step 5: Weibull quantile transform ────────────────────────────────────
     v = df["ws_150m_raw"].clip(lower=0.01).values
-    df["ws_150m_corrected"] = A_gwa_hub * (v / A_era5_150) ** (k_era5_150 / k_gwa_hub)
+    if A_era5_150 < 0.01:
+        # Degenerate Weibull fit (near-zero wind site) — skip quantile transform
+        df["ws_150m_corrected"] = df["ws_150m_raw"].clip(lower=0)
+    else:
+        df["ws_150m_corrected"] = A_gwa_hub * (v / A_era5_150) ** (k_era5_150 / k_gwa_hub)
 
     # ── Step 6: Air density at hub height ────────────────────────────────────
     # Hub height above sea level determines both pressure and temperature.
@@ -564,13 +571,19 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
     else:
         T_hub_K = 288.15 - 0.0065 * h_asl  # ISA fallback when no ERA5 temperature
     P_hub = 101325.0 * (1.0 - 2.2558e-5 * h_asl) ** 5.2559
-    df["air_density"] = (P_hub / (287.05 * T_hub_K)).clip(0.9, 1.4)
+    air_density_raw = P_hub / (287.05 * T_hub_K)
+    df["air_density"] = air_density_raw.clip(0.9, 1.4)
+    try:
+        _density_clip_frac = float(((air_density_raw < 0.9) | (air_density_raw > 1.4)).mean())
+    except AttributeError:
+        _density_clip_frac = 0.0
 
     meta = {
         "hub_height": hub_height,
         "h100_used": h100,
         "h150_used": hub_height,
         "alpha_mean": alpha_mean,
+        "alpha_raw": _alpha_raw,
         "alpha_50_150": alpha_50_150,
         "diurnal_alpha": diurnal_alpha,
         "mean_era5_100": df["ws_100m"].mean(),
@@ -585,6 +598,7 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
         "k_gwa_150": k_gwa_hub,
         "gwa_roughness_used": g100.get("roughness"),
         "mean_air_density": float(df["air_density"].mean()),
+        "density_clip_frac": _density_clip_frac,
         "site_elevation": elevation,
     }
 
@@ -1748,6 +1762,19 @@ if run_btn:
         with st.spinner("Running processing pipeline…"):
             df, meta = run_pipeline(df_era5, gwc, heights, hub_height=hub_height, elevation=site_elevation)
 
+        if meta.get("alpha_raw", meta["alpha_mean"]) != meta["alpha_mean"]:
+            st.warning(
+                f"Wind shear exponent α = {meta['alpha_raw']:.3f} (from GWA) is outside the "
+                f"plausible range [0.05, 0.60] and has been clamped to {meta['alpha_mean']:.3f}. "
+                f"Check GWA statistics for this location."
+            )
+        if meta.get("density_clip_frac", 0) > 0.01:
+            st.warning(
+                f"Air density at hub height was outside 0.9–1.4 kg/m³ for "
+                f"{meta['density_clip_frac']*100:.0f}% of hours and has been clipped. "
+                f"At very high-altitude sites (>3000 m ASL) the ISA model may underestimate density."
+            )
+
         # Persist for PDF report (survives re-renders)
         st.session_state["site_df"]   = df
         st.session_state["site_meta"] = meta
@@ -2109,54 +2136,55 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         bc = (bins[:-1] + bins[1:]) / 2
         bin_w = 0.5
 
-        h_raw, _ = np.histogram(
-            df["ws_150m_raw"].dropna(), bins=bins, density=True
-        )
-        h_corr, _ = np.histogram(
-            df["ws_150m_corrected"].dropna(), bins=bins, density=True
-        )
-        pdf_gwa = weibull_min.pdf(bc, c=meta["k_gwa_150"], scale=meta["A_gwa_150"])
+        _ws_raw_vals = df["ws_150m_raw"].dropna()
+        _ws_corr_vals = df["ws_150m_corrected"].dropna()
+        if len(_ws_raw_vals) < 10 or len(_ws_corr_vals) < 10:
+            st.info("Insufficient wind data to plot distribution.")
+        else:
+            h_raw, _ = np.histogram(_ws_raw_vals, bins=bins, density=True)
+            h_corr, _ = np.histogram(_ws_corr_vals, bins=bins, density=True)
+            pdf_gwa = weibull_min.pdf(bc, c=meta["k_gwa_150"], scale=meta["A_gwa_150"])
 
-        fig_wb = go.Figure()
-        fig_wb.add_trace(
-            go.Bar(
-                x=bc,
-                y=h_raw * bin_w,
-                name=f"ERA5 extrap. {hub_height:.0f} m",
-                marker_color="rgba(148,163,184,0.45)",
-                width=bin_w,
+            fig_wb = go.Figure()
+            fig_wb.add_trace(
+                go.Bar(
+                    x=bc,
+                    y=h_raw * bin_w,
+                    name=f"ERA5 extrap. {hub_height:.0f} m",
+                    marker_color="rgba(148,163,184,0.45)",
+                    width=bin_w,
+                )
             )
-        )
-        fig_wb.add_trace(
-            go.Bar(
-                x=bc,
-                y=h_corr * bin_w,
-                name=f"GWA-corrected {hub_height:.0f} m",
-                marker_color="rgba(79,70,229,0.55)",
-                width=bin_w,
+            fig_wb.add_trace(
+                go.Bar(
+                    x=bc,
+                    y=h_corr * bin_w,
+                    name=f"GWA-corrected {hub_height:.0f} m",
+                    marker_color="rgba(79,70,229,0.55)",
+                    width=bin_w,
+                )
             )
-        )
-        fig_wb.add_trace(
-            go.Scatter(
-                x=bc,
-                y=pdf_gwa * bin_w,
-                mode="lines",
-                name="GWA Weibull target",
-                line=dict(color="#0F172A", width=2.0, dash="dash"),
+            fig_wb.add_trace(
+                go.Scatter(
+                    x=bc,
+                    y=pdf_gwa * bin_w,
+                    mode="lines",
+                    name="GWA Weibull target",
+                    line=dict(color="#0F172A", width=2.0, dash="dash"),
+                )
             )
-        )
-        fig_wb.update_layout(
-            template="plotly_white",
-            barmode="overlay",
-            xaxis=dict(title="Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
-            yaxis=dict(title="Probability", gridcolor="rgba(0,0,0,0.05)"),
-            height=330,
-            margin=dict(t=15, b=60, l=55, r=20),
-            legend=dict(orientation="h", y=-0.3),
-            font=dict(color="#64748B", size=11),
-        )
-        st.plotly_chart(fig_wb, use_container_width=True)
-        st.markdown(f"""
+            fig_wb.update_layout(
+                template="plotly_white",
+                barmode="overlay",
+                xaxis=dict(title="Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
+                yaxis=dict(title="Probability", gridcolor="rgba(0,0,0,0.05)"),
+                height=330,
+                margin=dict(t=15, b=60, l=55, r=20),
+                legend=dict(orientation="h", y=-0.3),
+                font=dict(color="#64748B", size=11),
+            )
+            st.plotly_chart(fig_wb, use_container_width=True)
+            st.markdown(f"""
         <div class="ann">
         Blue bars = ERA5 extrapolated (pre-correction). Green bars = GWA-corrected output.
         Red dashed line = GWA Weibull target (A = {meta['A_gwa_150']:.2f} m/s, k = {meta['k_gwa_150']:.2f}).
@@ -2624,8 +2652,9 @@ if "aep_df" in st.session_state:
             '<p class="sh" style="margin-top:1.5rem;">Mean Monthly Net Energy</p>',
             unsafe_allow_html=True,
         )
-        _monthly_net = (_aep["net_mw_ts"] * _other_loss_factor).resample("ME").sum()
-        _monthly_gross = _aep["gross_mw_ts"].resample("ME").sum()
+        _interval_h = (_aep["gross_mw_ts"].index[1] - _aep["gross_mw_ts"].index[0]).total_seconds() / 3600
+        _monthly_net = (_aep["net_mw_ts"] * _other_loss_factor).resample("ME").sum() * _interval_h
+        _monthly_gross = _aep["gross_mw_ts"].resample("ME").sum() * _interval_h
         _mnet_avg = _monthly_net.groupby(_monthly_net.index.month).mean()
         _mgross_avg = _monthly_gross.groupby(_monthly_gross.index.month).mean()
 

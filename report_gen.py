@@ -631,7 +631,7 @@ def _pages_introduction(pdf, start_year, end_year, page_counter):
     )
 
     pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
-    page_counter[0] = pg
+    page_counter[0] = pg + 1
 
 
 def _pages_methodology(pdf, has_density, has_aep, has_subhourly, page_counter):
