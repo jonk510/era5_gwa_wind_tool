@@ -1081,6 +1081,12 @@ with st.sidebar:
     if app_mode == "Single Site":
         st.markdown('<p style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#94A3B8;margin:0.5rem 0 0.3rem 0;">Location</p>', unsafe_allow_html=True)
 
+        st.text_input(
+            "Site name",
+            placeholder="e.g. Augusta WTG01",
+            key="site_name_input",
+        )
+
         crs_choice = st.selectbox(
             "Coordinate system",
             options=list(_EPSG_OPTIONS.keys()),
@@ -2275,9 +2281,11 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         # Build metadata header lines (# prefix so parsers can skip easily)
         _era5_node = st.session_state.get("era5_node")
         _gwa_node  = st.session_state.get("gwa_node")
+        _site_name_csv = st.session_state.get("site_name_input", "").strip()
         _header_lines = [
             "# ERA5 x GWA Wind Resource Synthesis - synthesised time series",
             "#",
+            *([ f"# Site name:          {_site_name_csv}" ] if _site_name_csv else []),
             f"# Latitude (input):   {lat:.4f}",
             f"# Longitude (input):  {lon:.4f}",
             (f"# ERA5 grid node:     {_era5_node[0]:.4f}N, {_era5_node[1]:.4f}E  (~0.25 deg grid, ~28 km)"
@@ -2381,7 +2389,8 @@ if "wind_csv" in st.session_state and app_mode == "Single Site":
         _ss_lat  = st.session_state.get("aep_lat", lat)
         _ss_lon  = st.session_state.get("aep_lon", lon)
         _ss_hub  = int(st.session_state.get("aep_hub_height", hub_height))
-        _ss_name = f"Site ({_ss_lat:.4f}, {_ss_lon:.4f})"
+        _ss_name_input = st.session_state.get("site_name_input", "").strip()
+        _ss_name = _ss_name_input or f"Site ({_ss_lat:.4f}, {_ss_lon:.4f})"
 
         if _ss_df is not None and _ss_meta is not None:
             _ss_row = {
@@ -2405,22 +2414,24 @@ if "wind_csv" in st.session_state and app_mode == "Single Site":
             }
             if _ss_aep is not None:
                 _ar = _ss_aep["aep"]
+                _ss_net_adj = _ss_aep.get("net_aep_adj", _ar["net_aep_mwh"])
+                _ss_cf_adj  = _ss_aep.get("cf_adj", _ar["capacity_factor"])
                 _ss_row.update({
                     "gross_aep_mwh_yr":     _ar["gross_aep_mwh"],
-                    "net_aep_mwh_yr":       _ar["net_aep_mwh"],
+                    "net_aep_mwh_yr":       _ss_net_adj,
                     "turbine_type":         _ss_aep["wtg"],
                     "nameplate_mw":         _ss_aep["nameplate_mw"],
                     "mean_wake_loss_pct":   _ar["mean_wake_pct"],
-                    "capacity_factor_pct":  _ar["capacity_factor"] * 100,
+                    "capacity_factor_pct":  _ss_cf_adj * 100,
                 })
                 _ss_entry.update({
                     "aep": {
                         "gross_mw":        _ar["gross_mw_ts"],
                         "net_mw":          _ar["net_mw_ts"],
                         "gross_aep_mwh":   _ar["gross_aep_mwh"],
-                        "net_aep_mwh":     _ar["net_aep_mwh"],
+                        "net_aep_mwh":     _ss_net_adj,
                         "mean_wake_pct":   _ar["mean_wake_pct"],
-                        "capacity_factor": _ar["capacity_factor"],
+                        "capacity_factor": _ss_cf_adj,
                         "rated_kw":        _ar["rated_kw"],
                     },
                     "wtg":         _ss_aep["wtg"],
@@ -2491,6 +2502,17 @@ if "aep_df" in st.session_state:
                 help="Requires data/wake_loss_matrix.xlsx" if _wake_df is None else "",
             )
 
+        st.markdown('<p style="font-size:0.68rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#94A3B8;margin:1rem 0 0.3rem 0;">Energy Losses</p>', unsafe_allow_html=True)
+        _lc1, _lc2, _lc3, _lc4 = st.columns(4)
+        with _lc1:
+            _avail_loss = st.number_input("Availability loss [%]", min_value=0.0, max_value=50.0, value=0.0, step=0.1, format="%.1f")
+        with _lc2:
+            _elec_loss = st.number_input("Electrical loss [%]", min_value=0.0, max_value=50.0, value=2.0, step=0.1, format="%.1f")
+        with _lc3:
+            _tp_loss = st.number_input("Turbine performance loss [%]", min_value=0.0, max_value=50.0, value=0.0, step=0.1, format="%.1f")
+        with _lc4:
+            _deg_loss = st.number_input("Degradation [%]", min_value=0.0, max_value=50.0, value=0.0, step=0.1, format="%.1f")
+
         # Power curve preview scaled to nameplate
         _ws_c = _pc_df.index.values
         _kw_c = _pc_df[_selected_wtg].values
@@ -2525,8 +2547,30 @@ if "aep_df" in st.session_state:
             _wake_df if _apply_wake else None,
             density_series=_density_aep,
         )
+
+        # Apply additional losses (multiplicative)
+        _other_loss_factor = (
+            (1 - _avail_loss / 100)
+            * (1 - _elec_loss / 100)
+            * (1 - _tp_loss / 100)
+            * (1 - _deg_loss / 100)
+        )
+        _other_loss_pct = (1 - _other_loss_factor) * 100
+        _net_aep_adj = _aep["net_aep_mwh"] * _other_loss_factor
+        _cf_adj = _net_aep_adj / (_nameplate_mw * 8760.0)
+        _total_loss_pct = (1 - (_aep["net_aep_mwh"] / _aep["gross_aep_mwh"]) * _other_loss_factor) * 100 if _aep["gross_aep_mwh"] > 0 else 0.0
+
         st.session_state["site_aep_results"] = {
-            "aep": _aep, "wtg": _selected_wtg, "nameplate_mw": _nameplate_mw,
+            "aep": _aep,
+            "wtg": _selected_wtg,
+            "nameplate_mw": _nameplate_mw,
+            "net_aep_adj": _net_aep_adj,
+            "cf_adj": _cf_adj,
+            "avail_loss": _avail_loss,
+            "elec_loss": _elec_loss,
+            "tp_loss": _tp_loss,
+            "deg_loss": _deg_loss,
+            "other_loss_pct": _other_loss_pct,
         }
 
         # Metrics
@@ -2536,12 +2580,12 @@ if "aep_df" in st.session_state:
         _am1, _am2, _am3, _am4, _am5 = st.columns(5)
         _am1.metric("Gross AEP", _energy_str(_aep["gross_aep_mwh"]))
         _am2.metric(
-            "Net AEP",
-            _energy_str(_aep["net_aep_mwh"]),
-            delta=f"−{_aep['mean_wake_pct']:.1f}% wake" if _aep["mean_wake_pct"] > 0 else None,
+            "Net AEP (post-losses)",
+            _energy_str(_net_aep_adj),
+            delta=f"−{_total_loss_pct:.1f}% total losses" if _total_loss_pct > 0 else None,
             delta_color="inverse",
         )
-        _am3.metric("Capacity Factor", f"{_aep['capacity_factor'] * 100:.1f}%")
+        _am3.metric("Capacity Factor", f"{_cf_adj * 100:.1f}%")
         _am4.metric("Rated (from curve)", f"{_aep['rated_kw'] / 1000:.2f} MW")
         _am5.metric(
             "Air Density",
@@ -2550,11 +2594,27 @@ if "aep_df" in st.session_state:
             delta_color="off",
         )
 
+        _loss_breakdown_parts = []
+        if _apply_wake and _wake_df is not None and _aep["mean_wake_pct"] > 0:
+            _loss_breakdown_parts.append(f"wake {_aep['mean_wake_pct']:.1f}%")
+        if _avail_loss > 0:
+            _loss_breakdown_parts.append(f"availability {_avail_loss:.1f}%")
+        if _elec_loss > 0:
+            _loss_breakdown_parts.append(f"electrical {_elec_loss:.1f}%")
+        if _tp_loss > 0:
+            _loss_breakdown_parts.append(f"turbine performance {_tp_loss:.1f}%")
+        if _deg_loss > 0:
+            _loss_breakdown_parts.append(f"degradation {_deg_loss:.1f}%")
+        _loss_note = (
+            f" Losses applied: {', '.join(_loss_breakdown_parts)} (combined −{_total_loss_pct:.1f}%)."
+            if _loss_breakdown_parts else " No losses applied."
+        )
+
         st.markdown(
             f'<div class="ann">'
             f'<strong>{_selected_wtg}</strong> normalised to rated output and scaled to '
-            f'<strong>{_nameplate_mw:.1f} MW</strong> nameplate capacity. '
-            f'{"Wake losses applied via 2D interpolation of the wind-speed × nameplate capacity matrix." if _apply_wake and _wake_df is not None else "No wake correction applied — add <code>data/wake_loss_matrix.xlsx</code> to enable."}'
+            f'<strong>{_nameplate_mw:.1f} MW</strong> nameplate capacity.'
+            f'{_loss_note}'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -2564,7 +2624,7 @@ if "aep_df" in st.session_state:
             '<p class="sh" style="margin-top:1.5rem;">Mean Monthly Net Energy</p>',
             unsafe_allow_html=True,
         )
-        _monthly_net = _aep["net_mw_ts"].resample("ME").sum()
+        _monthly_net = (_aep["net_mw_ts"] * _other_loss_factor).resample("ME").sum()
         _monthly_gross = _aep["gross_mw_ts"].resample("ME").sum()
         _mnet_avg = _monthly_net.groupby(_monthly_net.index.month).mean()
         _mgross_avg = _monthly_gross.groupby(_monthly_gross.index.month).mean()
@@ -2576,7 +2636,7 @@ if "aep_df" in st.session_state:
         ))
         _fig_maep.add_trace(go.Bar(
             x=MONTH_LABELS, y=_mnet_avg.values,
-            name="Net energy (after wake)", marker_color="rgba(79,70,229,0.7)",
+            name="Net energy (after all losses)", marker_color="rgba(79,70,229,0.7)",
         ))
         _fig_maep.update_layout(
             template="plotly_white",
@@ -2595,9 +2655,11 @@ if "aep_df" in st.session_state:
             f"UTC{_tz_offset_str(_df_aep.index)}" if tz_display != "UTC" else "UTC"
         )
         _aep_n_yr = (_df_aep.index[-1] - _df_aep.index[0]).days / 365.25
+        _aep_site_name = st.session_state.get("site_name_input", "").strip()
         _aep_header_lines = [
             "# ERA5 x GWA Wind Resource Synthesis - AEP time series",
             "#",
+            *([ f"# Site name:          {_aep_site_name}" ] if _aep_site_name else []),
             f"# Latitude (input):   {_aep_lat:.4f}",
             f"# Longitude (input):  {_aep_lon:.4f}",
             f"# Timezone:           {tz_display} ({_aep_tz_sfx})",
@@ -2610,9 +2672,15 @@ if "aep_df" in st.session_state:
             f"# Air density:        {_aep['mean_air_density']:.4f} kg/m3 mean at hub height (IEC V_eq = V*(rho/1.225)^(1/3) applied)",
             "#",
             f"# Gross AEP:          {_energy_str(_aep['gross_aep_mwh'])}",
-            f"# Net AEP:            {_energy_str(_aep['net_aep_mwh'])}",
+            f"# Net AEP (wake only): {_energy_str(_aep['net_aep_mwh'])}",
             f"# Mean wake loss:     {_aep['mean_wake_pct']:.1f} %",
-            f"# Capacity factor:    {_aep['capacity_factor']*100:.1f} %",
+            f"# Availability loss:  {_avail_loss:.1f} %",
+            f"# Electrical loss:    {_elec_loss:.1f} %",
+            f"# Turbine perf. loss: {_tp_loss:.1f} %",
+            f"# Degradation:        {_deg_loss:.1f} %",
+            f"# Total other losses: {_other_loss_pct:.2f} %",
+            f"# Net AEP (all losses): {_energy_str(_net_aep_adj)}",
+            f"# Capacity factor:    {_cf_adj*100:.1f} %",
             "#",
             "# INDICATIVE ONLY - wind speeds are synthesised from ERA5 + GWA, not measured.",
             "#",
@@ -2642,6 +2710,7 @@ if "aep_df" in st.session_state:
         )
         st.caption(
             f"{_selected_wtg} · {_nameplate_mw:.1f} MW nameplate · "
-            f"{'Wake-corrected' if _apply_wake and _wake_df is not None else 'No wake correction'} · "
-            f"{_aep_n_yr:.1f}-year record"
+            f"{'Wake-corrected' if _apply_wake and _wake_df is not None else 'No wake correction'}"
+            + (f" · other losses {_other_loss_pct:.1f}%" if _other_loss_pct > 0 else "")
+            + f" · {_aep_n_yr:.1f}-year record"
         )
