@@ -63,6 +63,31 @@ def _tz_offset_str(index: pd.DatetimeIndex) -> str:
     except Exception:
         return ""
 
+
+def _prevailing_wd(df: pd.DataFrame) -> float | None:
+    """Vector-mean wind direction from ERA5 100m records."""
+    if "wd_100m" not in df.columns:
+        return None
+    wd_rad = np.radians(df["wd_100m"].dropna().values)
+    if len(wd_rad) == 0:
+        return None
+    return float(np.degrees(np.arctan2(np.sin(wd_rad).mean(), np.cos(wd_rad).mean())) % 360)
+
+
+def _offset_latlon(lat: float, lon: float, bearing_deg: float, distance_m: float) -> tuple[float, float]:
+    """Return (lat, lon) displaced from origin by distance_m in compass bearing (degrees CW from N)."""
+    R = 6371000.0
+    d = distance_m / R
+    lat_r, lon_r = np.radians(lat), np.radians(lon)
+    brng = np.radians(bearing_deg % 360)
+    lat2 = np.arcsin(np.sin(lat_r) * np.cos(d) + np.cos(lat_r) * np.sin(d) * np.cos(brng))
+    lon2 = lon_r + np.arctan2(
+        np.sin(brng) * np.sin(d) * np.cos(lat_r),
+        np.cos(d) - np.sin(lat_r) * np.sin(lat2),
+    )
+    return float(np.degrees(lat2)), float(np.degrees(lon2))
+
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ERA5 + GWA 150m Wind Tool",
@@ -254,7 +279,7 @@ def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
             "longitude": lon,
             "start_date": f"{start_year}-01-01",
             "end_date": f"{end_year}-12-31",
-            "hourly": "wind_speed_100m,wind_speed_10m,wind_gusts_10m,wind_direction_100m,temperature_2m",
+            "hourly": "wind_speed_100m,wind_speed_10m,wind_gusts_10m,wind_direction_100m,temperature_2m,boundary_layer_height",
             "wind_speed_unit": "ms",
             "timezone": "UTC",
         },
@@ -265,6 +290,7 @@ def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
     era5_lat = d.get("latitude", lat)
     era5_lon = d.get("longitude", lon)
     elevation = float(d.get("elevation", 0.0))
+    _n = len(d["hourly"]["time"])
     df = pd.DataFrame(
         {
             "ws_100m": d["hourly"]["wind_speed_100m"],
@@ -272,10 +298,12 @@ def fetch_era5(lat: float, lon: float, start_year: int, end_year: int):
             "ws_gust_10m": d["hourly"]["wind_gusts_10m"],
             "wd_100m": d["hourly"]["wind_direction_100m"],
             "temp_2m": d["hourly"]["temperature_2m"],
+            "blh": d["hourly"].get("boundary_layer_height", [None] * _n),
         },
         index=pd.to_datetime(d["hourly"]["time"]),
     )
-    return df.dropna(), era5_lat, era5_lon, elevation
+    # Drop only on core wind columns so BLH NaNs don't discard valid records
+    return df.dropna(subset=["ws_100m", "ws_10m", "ws_gust_10m", "wd_100m", "temp_2m"]), era5_lat, era5_lon, elevation
 
 
 @st.cache_data(show_spinner=False)
@@ -318,27 +346,58 @@ _OSM_DEFAULT_LAND = 0.1   # fallback for any unrecognised land-cover tag
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def fetch_site_roughness(lat: float, lon: float) -> tuple[float, str]:
+def fetch_site_roughness(
+    lat: float,
+    lon: float,
+    prevailing_wd_deg: float | None = None,
+    fetch_radius_m: int = 10000,
+) -> tuple[float, str]:
     """
-    Estimate aerodynamic roughness length (m) at the site from OpenStreetMap
-    land-use/natural tags within a 500 m radius via the Overpass API.
+    Estimate aerodynamic roughness length (m) from OpenStreetMap land-use tags.
+
+    When prevailing_wd_deg is supplied, queries a 120°-wide sector centred on
+    that direction (the upwind fetch) out to fetch_radius_m.  Falls back to an
+    omnidirectional circle of the same radius if no direction is available.
+
+    fetch_radius_m defaults to 10 km; callers should pass 100 × hub_height
+    (capped at 15 km) for a physically motivated fetch distance.
 
     Returns (roughness_m, description_string).
-    Falls back to (0.1, "default") if the query fails or returns no data.
     """
     _fallback = (0.1, "default (r = 0.10 m — open land, no OSM data)")
-    query = (
-        f"[out:json][timeout:10];"
-        f"(way[\"landuse\"](around:500,{lat},{lon});"
-        f"way[\"natural\"](around:500,{lat},{lon}););"
-        f"out tags;"
-    )
+
+    if prevailing_wd_deg is not None:
+        # Build a closed sector polygon: site → arc at fetch_radius → back to site
+        half = 60  # ±60° gives a 120° sector covering the dominant upwind quadrant
+        wd = prevailing_wd_deg % 360
+        pts = [f"{lat} {lon}"]
+        for angle in range(int(wd - half), int(wd + half) + 1, 5):
+            p = _offset_latlon(lat, lon, float(angle % 360), fetch_radius_m)
+            pts.append(f"{p[0]:.6f} {p[1]:.6f}")
+        pts.append(f"{lat} {lon}")
+        poly_str = " ".join(pts)
+        query = (
+            f'[out:json][timeout:20];'
+            f'(way["landuse"](poly:"{poly_str}");'
+            f'way["natural"](poly:"{poly_str}"););'
+            f'out tags;'
+        )
+        fetch_desc = f"upwind sector {wd:.0f}° ±60°, {fetch_radius_m/1000:.0f} km"
+    else:
+        query = (
+            f'[out:json][timeout:20];'
+            f'(way["landuse"](around:{fetch_radius_m},{lat},{lon});'
+            f'way["natural"](around:{fetch_radius_m},{lat},{lon}););'
+            f'out tags;'
+        )
+        fetch_desc = f"omnidirectional {fetch_radius_m/1000:.0f} km radius"
+
     try:
         resp = requests.post(
             "https://overpass-api.de/api/interpreter",
             data={"data": query},
             headers={"User-Agent": "ERA5-GWA-WindTool/1.0 (wind resource research)"},
-            timeout=12,
+            timeout=25,
         )
         resp.raise_for_status()
         elements = resp.json().get("elements", [])
@@ -359,7 +418,7 @@ def fetch_site_roughness(lat: float, lon: float) -> tuple[float, str]:
 
         median_r = float(np.median(rough_vals))
         dominant = max(set(tag_names), key=tag_names.count)
-        return median_r, f"OpenStreetMap (dominant: {dominant}, r = {median_r:.4f} m)"
+        return median_r, f"OpenStreetMap ({fetch_desc}, dominant: {dominant}, r = {median_r:.4f} m)"
 
     except Exception:
         return _fallback
@@ -480,7 +539,18 @@ def calc_aep(
 
 # ── Processing pipeline ───────────────────────────────────────────────────────
 
-def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: float = 150.0, elevation: float = 0.0) -> tuple:
+def run_pipeline(
+    df_era5: pd.DataFrame,
+    gwc: dict,
+    heights: list,
+    hub_height: float = 150.0,
+    elevation: float = 0.0,
+    amplitude_scale: float = 1.0,
+    alpha_clip_lo: float = 0.02,
+    alpha_clip_hi: float = 1.0,
+    alpha_mean_lo: float = 0.03,
+    alpha_mean_hi: float = 0.70,
+) -> tuple:
     """
     Full processing pipeline for an arbitrary hub height:
       1. Derive mean-shear alpha from GWA 100m → hub_height means.
@@ -514,7 +584,7 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
         alpha_mean = np.log(mean_gwa_hub / mean_gwa_100) / log_h_ratio
 
     _alpha_raw = alpha_mean
-    alpha_mean = max(0.05, min(alpha_mean, 0.60))
+    alpha_mean = max(alpha_mean_lo, min(alpha_mean, alpha_mean_hi))
 
     # Supplementary: α from ~50m → hub_height (reference only, shown in UI)
     alpha_50_150 = None
@@ -529,23 +599,51 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
             if abs(log_50_hub) > 1e-6:
                 alpha_50_150 = np.log(mean_gwa_hub / g50["mean"]) / log_50_hub
 
-    # ── Step 2: ERA5 diurnal shear pattern ───────────────────────────────────
+    # ── Step 2: Per-timestep stability → α(t) ────────────────────────────────
     df = df_era5.copy()
     df["hour"] = df.index.hour
 
+    # Compute ERA5 10/100m instantaneous shear std — used to calibrate amplitude
+    # for both BLH and hour-of-day paths.
     valid = df[(df["ws_10m"] > 0.5) & (df["ws_100m"] > 0.5)].copy()
-    valid["log_shear"] = np.log(valid["ws_100m"] / valid["ws_10m"]) / np.log(100 / 10)
+    if len(valid) > 10:
+        valid["log_shear"] = np.log(valid["ws_100m"] / valid["ws_10m"]) / np.log(100 / 10)
+        alpha_std_era5 = max(float(valid["log_shear"].clip(0.0, 1.5).std()), 0.03)
+    else:
+        alpha_std_era5 = 0.10
 
-    diurnal_era5 = (
-        valid.groupby("hour")["log_shear"]
-        .mean()
-        .clip(0.03, 0.8)
-        .reindex(range(24), fill_value=alpha_mean)
-    )
-    diurnal_alpha = diurnal_era5 / diurnal_era5.mean() * alpha_mean
+    has_blh = "blh" in df.columns and df["blh"].notna().mean() > 0.5
+
+    if has_blh:
+        # BLH stability index: hub_height / BLH
+        #   > 1 → rotor above stable nocturnal BL top → strong shear (high α)
+        #   ≈ 0 → rotor well inside convective mixed layer → weak shear (low α)
+        blh_filled = df["blh"].fillna(df["blh"].median()).clip(lower=10.0)
+        si = (hub_height / blh_filled).clip(0.0, 5.0)
+        si_std = float(si.std())
+        si_norm = (si - si.mean()) / si_std if si_std > 1e-6 else pd.Series(0.0, index=df.index)
+        df["alpha_h"] = (alpha_mean + amplitude_scale * alpha_std_era5 * si_norm).clip(
+            alpha_clip_lo, alpha_clip_hi
+        )
+        alpha_method = "ERA5 boundary layer height (per-timestep)"
+    else:
+        # Fallback: hour-of-day climatological shear from ERA5 10m/100m ratio
+        if len(valid) > 10:
+            diurnal_era5 = (
+                valid.groupby("hour")["log_shear"]
+                .mean()
+                .reindex(range(24), fill_value=alpha_mean)
+            )
+            deviation = diurnal_era5 - diurnal_era5.mean()
+            diurnal_scaled = (alpha_mean + amplitude_scale * deviation).clip(
+                alpha_clip_lo, alpha_clip_hi
+            )
+        else:
+            diurnal_scaled = pd.Series(alpha_mean, index=range(24))
+        df["alpha_h"] = df["hour"].map(diurnal_scaled).fillna(alpha_mean)
+        alpha_method = "ERA5 10m/100m shear (hour-of-day, BLH unavailable)"
 
     # ── Step 3: Height extrapolation to hub_height ───────────────────────────
-    df["alpha_h"] = df["hour"].map(diurnal_alpha).fillna(alpha_mean)
     df["ws_150m_raw"] = df["ws_100m"] * (hub_height / 100.0) ** df["alpha_h"]
 
     # ── Step 4: Fit Weibull to ERA5 at hub_height ────────────────────────────
@@ -585,7 +683,8 @@ def run_pipeline(df_era5: pd.DataFrame, gwc: dict, heights: list, hub_height: fl
         "alpha_mean": alpha_mean,
         "alpha_raw": _alpha_raw,
         "alpha_50_150": alpha_50_150,
-        "diurnal_alpha": diurnal_alpha,
+        "diurnal_alpha": df.groupby(df.index.hour)["alpha_h"].mean().reindex(range(24), fill_value=alpha_mean),
+        "alpha_method": alpha_method,
         "mean_era5_100": df["ws_100m"].mean(),
         "mean_era5_150_raw": df["ws_150m_raw"].mean(),
         "mean_corrected": df["ws_150m_corrected"].mean(),
@@ -1215,6 +1314,44 @@ with st.sidebar:
         help="Height for wind speed extrapolation and GWA Weibull correction. Used as the default in batch mode when no hub_height column is present.",
     )
     st.divider()
+    with st.expander("⚙️ Advanced settings"):
+        st.caption(
+            "Adjust diurnal shear amplitude and α bounds. Leave at defaults unless "
+            "calibrating against site measurements."
+        )
+        amplitude_scale = st.slider(
+            "Diurnal amplitude scale",
+            min_value=0.5, max_value=3.0, value=1.0, step=0.05,
+            help=(
+                "Multiplies the per-timestep α deviation from the long-term mean. "
+                "1.0 = ERA5 native amplitude. Increase (e.g. 1.3–1.6) if measured "
+                "diurnal variation exceeds model output."
+            ),
+        )
+        _adv_c1, _adv_c2 = st.columns(2)
+        with _adv_c1:
+            alpha_clip_lo = st.number_input(
+                "α per-timestep — lower clip", min_value=0.01, max_value=0.10,
+                value=0.02, step=0.01, format="%.2f",
+                help="Floor on instantaneous shear exponent. Prevents unphysically low shear.",
+            )
+            alpha_mean_lo = st.number_input(
+                "Mean α — lower clamp", min_value=0.01, max_value=0.10,
+                value=0.03, step=0.01, format="%.2f",
+                help="Floor on the GWA-derived long-term mean α.",
+            )
+        with _adv_c2:
+            alpha_clip_hi = st.number_input(
+                "α per-timestep — upper clip", min_value=0.50, max_value=2.0,
+                value=1.0, step=0.05, format="%.2f",
+                help="Ceiling on instantaneous shear exponent.",
+            )
+            alpha_mean_hi = st.number_input(
+                "Mean α — upper clamp", min_value=0.40, max_value=1.0,
+                value=0.70, step=0.05, format="%.2f",
+                help="Ceiling on the GWA-derived long-term mean α.",
+            )
+    st.divider()
     if app_mode == "Single Site":
         run_btn = st.button("🚀  Fetch & Process Data", type="primary", use_container_width=True)
     else:
@@ -1324,12 +1461,18 @@ if app_mode == "Batch":
                                 _b_hub_h = float(_brow["hub_height"]) if _has_hh_col and pd.notna(_brow.get("hub_height")) else float(hub_height)
                                 _b_hh_int = int(_b_hub_h)
                                 _b_era5, _b_elat, _b_elon, _b_elevation = fetch_era5(_blat, _blon, _START_YEAR, _END_YEAR)
-                                _b_rough, _ = fetch_site_roughness(_blat, _blon)
+                                _b_prevailing = _prevailing_wd(_b_era5)
+                                _b_fetch_radius = int(min(max(5000, 100 * _b_hub_h), 15000))
+                                _b_rough, _ = fetch_site_roughness(_blat, _blon, _b_prevailing, _b_fetch_radius)
                                 _b_gwc, _b_heights, _b_glat, _b_glon = fetch_gwa(_blat, _blon, _b_rough)
                                 _b_tz = detect_timezone(_blat, _blon)
                                 _b_tz_disp = "UTC" if use_utc else _b_tz
                                 _b_df_era5 = localise_df(_b_era5, _b_tz_disp)
-                                _b_df, _b_meta = run_pipeline(_b_df_era5, _b_gwc, _b_heights, hub_height=_b_hub_h, elevation=_b_elevation)
+                                _b_df, _b_meta = run_pipeline(
+                                    _b_df_era5, _b_gwc, _b_heights, hub_height=_b_hub_h, elevation=_b_elevation,
+                                    amplitude_scale=amplitude_scale, alpha_clip_lo=alpha_clip_lo,
+                                    alpha_clip_hi=alpha_clip_hi, alpha_mean_lo=alpha_mean_lo, alpha_mean_hi=alpha_mean_hi,
+                                )
                                 _b_tz_sfx = f"UTC{_tz_offset_str(_b_df.index)}" if _b_tz_disp != "UTC" else "UTC"
 
                                 # Sub-hourly disaggregation (mirrors single-site behaviour)
@@ -1747,7 +1890,9 @@ if run_btn:
             df_era5_utc, era5_lat, era5_lon, site_elevation = fetch_era5(lat, lon, _START_YEAR, _END_YEAR)
 
         with st.spinner("Fetching Global Wind Atlas data…"):
-            site_roughness, rough_source = fetch_site_roughness(lat, lon)
+            _prevailing = _prevailing_wd(df_era5_utc)
+            _fetch_radius = int(min(max(5000, 100 * hub_height), 15000))
+            site_roughness, rough_source = fetch_site_roughness(lat, lon, _prevailing, _fetch_radius)
             gwc, heights, gwa_lat, gwa_lon = fetch_gwa(lat, lon, site_roughness)
 
         # Store grid node coordinates for the map (persists across re-renders)
@@ -1760,7 +1905,11 @@ if run_btn:
         df_era5 = localise_df(df_era5_utc, tz_display)
 
         with st.spinner("Running processing pipeline…"):
-            df, meta = run_pipeline(df_era5, gwc, heights, hub_height=hub_height, elevation=site_elevation)
+            df, meta = run_pipeline(
+                df_era5, gwc, heights, hub_height=hub_height, elevation=site_elevation,
+                amplitude_scale=amplitude_scale, alpha_clip_lo=alpha_clip_lo,
+                alpha_clip_hi=alpha_clip_hi, alpha_mean_lo=alpha_mean_lo, alpha_mean_hi=alpha_mean_hi,
+            )
 
         if meta.get("alpha_raw", meta["alpha_mean"]) != meta["alpha_mean"]:
             st.warning(
@@ -1989,24 +2138,56 @@ because it most accurately represents the shear in the layer we are extrapolatin
 """
             _diurnal_signal = "low" if (alpha_max - alpha_min) < 0.05 else "moderate" if (alpha_max - alpha_min) < 0.15 else "strong"
             _log_ratio = f"ln({hub_height:.0f}/100)"
+            _alpha_method = meta.get("alpha_method", "")
+            _using_blh = "boundary layer height" in _alpha_method
+
+            if _using_blh:
+                _step2_text = f"""
+**Step 2 — Per-timestep stability from ERA5 boundary layer height (BLH)**
+
+ERA5 BLH is the depth of the turbulent mixed layer. When BLH is below hub height the
+rotor sits above the stable nocturnal boundary layer — the classic low-level jet regime
+where shear is strongest. When BLH greatly exceeds hub height the atmosphere is well
+mixed and shear is low.
+
+A stability index is derived per timestep:
+
+$$SI(t) = \\frac{{h_{{hub}}}}{{BLH(t)}}$$
+
+clipped to [0, 5]. This is normalised to zero mean, unit standard deviation, then scaled
+to produce per-timestep α:
+
+$$\\alpha(t) = \\alpha_{{\\text{{mean}}}} + s \\cdot \\sigma_{{\\alpha}} \\cdot SI_{{\\text{{norm}}}}(t)$$
+
+where σ_α is the standard deviation of ERA5 10m/100m instantaneous shear and *s* is
+the amplitude scale (currently **{amplitude_scale:.2f}**). The chart shows the 24-hour
+binned mean of the per-timestep α for interpretability.
+"""
+            else:
+                _step2_text = f"""
+**Step 2 — Diurnal pattern from ERA5 10m/100m shear (hour-of-day fallback)**
+
+*(BLH data unavailable — using climatological hour-of-day grouping)*
+
+The hourly shape of α is inferred from ERA5 10m/100m ratios — stable nights produce
+stronger shear (higher α); convective days reduce it. The deviation from the mean is
+scaled by the amplitude factor (*s* = **{amplitude_scale:.2f}**) and anchored to α_mean.
+"""
+
             st.markdown(
                 f"""
-The shear exponent α is **diurnal** — it varies hour-by-hour, not a single constant.
+The shear exponent α varies **per timestep**, not a single constant.
 
 **Step 1 — Mean magnitude from GWA (100→{hub_height:.0f} m)**
 
 $$\\alpha_{{\\text{{mean}}}} = \\frac{{\\ln({meta['mean_gwa_150']:.2f}/{meta['mean_gwa_100']:.2f})}}{{{_log_ratio}}} = {meta['alpha_mean']:.3f}$$
 {_gwa50_eq}
-**Step 2 — Diurnal pattern from ERA5**
-The hourly shape of α is inferred from ERA5 10m/100m ratios — stable nights produce
-stronger shear (higher α); convective days reduce it. This pattern is normalised so its
-mean equals α_mean from Step 1.
+{_step2_text}
+**Result** — every record extrapolated with its own α(t):
 
-**Result** — every hourly record extrapolated with its own hour-specific α:
+$$V_{{{hub_height:.0f}}}(t) = V_{{100}}(t) \\times \\left(\\frac{{{hub_height:.0f}}}{{100}}\\right)^{{\\alpha(t)}}$$
 
-$$V_{{{hub_height:.0f}}}(t) = V_{{100}}(t) \\times \\left(\\frac{{{hub_height:.0f}}}{{100}}\\right)^{{\\alpha(h)}}, \\quad h = \\text{{hour of day ({tz_display})}}$$
-
-Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal).
+Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal).
                 """
             )
 
@@ -2050,10 +2231,11 @@ Diurnal range: **{alpha_min:.3f} – {alpha_max:.3f}** ({_diurnal_signal} signal
         st.markdown(f"""
         <div class="ann">
         <strong>Mean α ({meta['alpha_mean']:.3f})</strong> is anchored to GWA's 100→{hub_height:.0f} m speed ratio,
-        which sets the long-term shear used for height extrapolation. Hourly variation comes
-        from ERA5's 10m/100m ratio, capturing the real stability cycle.{_a50_note}
+        which sets the long-term shear used for height extrapolation. Per-timestep variation comes
+        from {meta.get('alpha_method', 'ERA5 stability signal')}, capturing real stability episodes.{_a50_note}
         </div>
         """, unsafe_allow_html=True)
+        st.caption(f"Stability source: {meta.get('alpha_method', '—')} · Amplitude scale: {amplitude_scale:.2f}")
 
         # ── Monthly mean time series ──────────────────────────────────────────
         st.markdown('<span class="lbl">Time Series</span><p class="sh">Monthly Mean Wind Speed</p>', unsafe_allow_html=True)
