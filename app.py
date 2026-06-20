@@ -1012,13 +1012,20 @@ spatial accuracy. The pipeline is described in full below.
 ERA5 is the European Centre for Medium-Range Weather Forecasts (ECMWF) global atmospheric
 reanalysis, covering 1940 to near-present at ~28 km horizontal resolution and 1-hour
 timesteps. It is accessed here via the [Open-Meteo archive API](https://open-meteo.com),
-which returns wind speed at **10 m** and **100 m** above ground level for a single grid
-node nearest to the input site. ERA5 captures the full temporal structure of the wind
-climate — inter-annual variability, seasonal cycles, storm events, diurnal patterns, and
-calm periods — but its coarse resolution means it cannot represent local terrain channelling,
-coastal effects, or roughness changes at the sub-kilometre scale. ERA5 wind speeds are
-therefore systematically biased relative to what a mast or turbine at the site would
-actually experience.
+which returns the following variables for the ERA5 grid node nearest to the input site:
+
+- Wind speed at **10 m** and **100 m** above ground level (m/s)
+- Wind direction at 100 m (°)
+- Wind gust at 10 m (m/s) — used for sub-hourly turbulence estimation
+- Air temperature at 2 m (°C) — used for air density calculation
+- **Boundary layer height (BLH, m)** — the depth of the turbulent mixed layer, used as
+  the primary atmospheric stability signal for per-timestep shear estimation
+
+ERA5 captures the full temporal structure of the wind climate — inter-annual variability,
+seasonal cycles, storm events, diurnal patterns, and calm periods — but its coarse
+resolution means it cannot represent local terrain channelling, coastal effects, or
+roughness changes at the sub-kilometre scale. ERA5 wind speeds are therefore systematically
+biased relative to what a mast or turbine at the site would actually experience.
 
 **Global Wind Atlas (GWA) — spatial calibration**
 
@@ -1040,25 +1047,36 @@ dimension, but they are far more spatially accurate than ERA5 alone.
 ERA5 provides wind at 100 m. To reach the hub height (default 150 m, user-adjustable), a
 **power-law extrapolation** is applied:
 
-$$V_{hub}(t) = V_{100}(t) \\times \\left(\\frac{h_{hub}}{100}\\right)^{\\alpha(h)}$$
+$$V_{hub}(t) = V_{100}(t) \\times \\left(\\frac{h_{hub}}{100}\\right)^{\\alpha(t)}$$
 
-The shear exponent α is not treated as a single constant — it is computed **hour-by-hour**
-to capture the diurnal stability cycle:
+The shear exponent α varies **per timestep** (not hour-of-day) to capture individual
+stability episodes:
 
 - **Magnitude:** The long-term mean α is anchored to GWA. Specifically, the GWA mean wind
   speeds at 100 m and hub height (log-linearly interpolated from the GWC Weibull parameters
   at available heights) give: α_mean = ln(V_hub_GWA / V_100_GWA) / ln(h_hub / 100).
   This ensures the extrapolated mean matches GWA's locally-calibrated estimate of shear.
 
-- **Diurnal shape:** The *hour-of-day pattern* of α is derived from the ERA5 10 m / 100 m
-  wind ratio across the full record. During stable nocturnal conditions the boundary layer
-  is stratified and shear is strong (high α); during the convective daytime mixing reduces
-  shear (low α). This 24-hour profile is normalised so its mean equals α_mean, preserving
-  both the physically correct diurnal shape and the GWA-calibrated magnitude.
+- **Per-timestep stability from ERA5 boundary layer height (primary method):** Each
+  hourly ERA5 BLH value is used to compute a stability index SI(t) = h_hub / BLH(t).
+  When BLH is below hub height (SI > 1), the rotor is above the stable nocturnal boundary
+  layer — the classic low-level jet regime — and shear is strong (high α). When BLH greatly
+  exceeds hub height (SI ≪ 1), the atmosphere is well-mixed and shear is low. The per-timestep
+  α is then:
 
-- **Limitation:** The diurnal pattern is derived from the 10–100 m ERA5 layer, which may
-  not perfectly represent shear in the 100 m–hub height layer, particularly for very tall
-  turbines. At 100 m hub height the extrapolation step is skipped entirely.
+$$\\alpha(t) = \\alpha_{mean} + s \\cdot \\sigma_{\\alpha} \\cdot SI_{norm}(t)$$
+
+  where σ_α is the standard deviation of ERA5 instantaneous 10–100 m shear (amplitude
+  calibration), SI_norm is the zero-mean unit-std normalised stability index, and **s** is
+  the amplitude scale parameter (default 1.0, adjustable in Advanced settings).
+
+  Unlike a simple hour-of-day grouping, this approach captures episode-to-episode stability
+  variability: a stormy winter night with deep BLH has low shear; a calm clear-sky winter
+  night with BLH of 50 m has very high shear — even at the same clock hour.
+
+- **Fallback (hour-of-day):** If BLH is unavailable, the diurnal shape of α is derived
+  from the ERA5 10 m / 100 m wind speed ratio, grouped by hour of day and normalised to
+  α_mean. The amplitude scale parameter is applied to the deviation in both cases.
 
 **Step 2 — Weibull quantile transform: bias correction to GWA**
 
@@ -1074,12 +1092,24 @@ from the GWA grid node (interpolated to hub height from the GWC file). This tran
 unchanged — only the speed distribution is reshaped to match GWA. The result is a time
 series that has ERA5's temporal fidelity and GWA's spatial accuracy.
 
-**Roughness class selection:** The GWA GWC file contains Weibull parameters for multiple
-roughness classes (0.0, 0.03, 0.1, 0.4, 3.0 m). The tool queries OpenStreetMap within
-500 m of the site to determine whether the point is over water, beach/bare ground, or
-general land, then selects the closest matching roughness class. This avoids the large
-positive bias (up to ~25%) that would result from inadvertently using the sea-surface
-roughness class (r = 0.0) for a land site.
+**Roughness class and directional fetch:** The GWA GWC file contains Weibull parameters
+for multiple roughness classes (0.0, 0.03, 0.1, 0.4, 3.0 m). The tool automatically
+selects the appropriate roughness class using a directional upwind fetch query:
+
+1. The ERA5 100 m vector-mean wind direction across the full record is computed to identify
+   the prevailing inflow direction.
+2. OpenStreetMap landuse and natural tags are queried within a **120°-wide sector polygon**
+   in that upwind direction, at a radius of **100 × hub_height** (bounded between 5 km and
+   15 km). For a 150 m turbine this is typically a 15 km radius sector — far larger than the
+   old 500 m omnidirectional circle.
+3. The dominant OSM tag determines roughness: water → r = 0.0003 m; beach/bare_rock →
+   r = 0.025 m; all other land → r = 0.1 m. The closest GWC roughness class is then
+   selected.
+4. If BLH or direction data is unavailable, the query falls back to an omnidirectional
+   circle at the same radius.
+
+This directional approach targets the actual upwind fetch that determines the boundary-layer
+profile reaching the turbine, rather than averaging over all directions equally.
 
 ---
 
@@ -1127,6 +1157,45 @@ bias introduced by disaggregation.
 
 ---
 
+### Advanced Settings
+
+The following parameters can be adjusted in the **Advanced settings** expander in the
+sidebar. Default values are calibrated to typical conditions; they can be fine-tuned if
+site measurements are available (see *Calibration* below).
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| **Diurnal amplitude scale (s)** | 1.0 | 0.5 – 3.0 | Multiplier on the BLH stability signal. Increase above 1.0 if the tool underestimates the day/night wind speed swing versus measurements; decrease if the swing is exaggerated. |
+| **α per-timestep clip (low)** | 0.02 | — | Minimum α applied at any single timestep. Prevents unphysically smooth shear profiles. |
+| **α per-timestep clip (high)** | 1.0 | — | Maximum α applied at any single timestep. Strong low-level jets can produce α > 0.5 above 100 m. |
+| **Mean α clamp (low)** | 0.03 | — | Minimum allowed value for α_mean (GWA-calibrated long-term average shear). |
+| **Mean α clamp (high)** | 0.70 | — | Maximum allowed value for α_mean. |
+
+---
+
+### Calibration against site measurements
+
+A standalone script `calibrate.py` is provided in the tool directory for fitting the
+diurnal amplitude scale against site mast or LiDAR measurements. It requires:
+
+- A measured wind speed CSV (any datetime-indexed format)
+- The tool's hourly output CSV for the same site
+
+Usage:
+```
+python calibrate.py --measured measured.csv --modelled model_output.csv [--plot]
+```
+
+The script aligns both records to a common hourly index, then uses `scipy.optimize`
+(bounded 1-D minimisation) to find the `amplitude_scale` that minimises the RMSE between
+the measured and modelled 24-hour mean diurnal wind speed profiles. With `--plot` it saves
+a comparison chart and the RMSE-vs-scale curve as `calibration_result.png`.
+
+The optimal scale value is reported at the end and can be directly entered into the
+Advanced settings panel without re-running the ERA5 fetch or GWA correction.
+
+---
+
 ### Limitations and appropriate use
 
 - **Not a measured record.** Output is synthesised from modelled data. Uncertainty is
@@ -1136,8 +1205,19 @@ bias introduced by disaggregation.
 - **GWA is a long-term climatology.** The GWA Weibull parameters represent a multi-decadal
   mean; they have no inter-annual variability of their own. Year-to-year variation in the
   output comes entirely from ERA5.
-- **Diurnal shear uses the 10–100 m ERA5 layer.** At hub heights well above 100 m the
-  actual diurnal shear profile may differ from this proxy.
+- **ERA5 BLH at ~28 km resolution.** The boundary layer height used for stability is also
+  ERA5-native resolution. Terrain-driven stability variations (valley drainage, coastal
+  internal boundary layers) at sub-28 km scales are not resolved. The amplitude scale
+  parameter exists partly to compensate for this systematic underestimation.
+- **BLH approach requires BLH data.** If the Open-Meteo API does not return BLH (rare),
+  the tool falls back to the hour-of-day ERA5 10/100 m shear grouping, which has less
+  episode-to-episode accuracy.
+- **Shear above 100 m.** Both the BLH approach and the 10–100 m fallback are calibrated
+  at ERA5 native levels. The nocturnal low-level jet (NLLJ), which often peaks between
+  50–300 m AGL, can produce shear exponents above 0.4–0.6 in the 100 m–hub height layer
+  that neither ERA5 variable directly measures. The amplitude scale can be increased to
+  partially compensate, but site mast data at or near hub height is the only reliable way
+  to validate this.
 - **Sub-hourly output is synthetic.** Each run produces one plausible realisation. Do not
   treat it as a real historical record or use it for fatigue-load analysis without
   understanding this limitation.

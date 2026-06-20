@@ -703,10 +703,11 @@ def _pages_methodology(pdf, has_density, has_aep, has_subhourly, page_counter):
     )
     era5_vars = [
         "Wind speed at 100 m above ground level (m/s) — primary wind input",
-        "Wind speed at 10 m above ground level (m/s) — used to estimate wind shear diurnal cycle",
+        "Wind speed at 10 m above ground level (m/s) — stability fallback and turbulence proxy",
         "Wind gust at 10 m (m/s) — used to estimate sub-hourly turbulence intensity",
-        "Wind direction at 100 m (°) — output to CSV for reference",
+        "Wind direction at 100 m (°) — used for directional roughness fetch and CSV output",
         "Air temperature at 2 m (°C) — used to calculate site air density",
+        "Boundary layer height (m) — primary atmospheric stability proxy for per-timestep shear",
     ]
     for v in era5_vars:
         y = _bullet(fig, y, v); y -= 0.003
@@ -743,11 +744,15 @@ def _pages_methodology(pdf, has_density, has_aep, has_subhourly, page_counter):
     )
     y = _para(fig, y,
         "Surface roughness class selection is a critical parameter in GWA. This tool "
-        "automatically queries OpenStreetMap within a 500 m radius of the site to classify "
-        "the terrain: water surfaces (r = 0.0003 m), beach or bare ground (r = 0.025 m), "
-        "or general land use (r = 0.1 m). The closest available GWA roughness class is "
-        "selected. Using the sea-surface roughness class for a land site would overestimate "
-        "wind speeds by 20–30%."
+        "selects the roughness class using a directional upwind fetch approach: (1) the "
+        "ERA5 100 m vector-mean wind direction is computed to identify the prevailing inflow "
+        "direction; (2) OpenStreetMap landuse and natural tags are queried within a 120-degree "
+        "sector polygon upwind of the site at a radius of 100 x hub_height (bounded 5–15 km); "
+        "(3) the dominant land cover determines roughness: water = 0.0003 m, bare ground = "
+        "0.025 m, general land = 0.1 m. The closest GWA roughness class is selected. This "
+        "directional fetch targets the actual upwind exposure rather than averaging over all "
+        "directions. Using the sea-surface class for a land site would overestimate wind "
+        "speeds by 20–30%."
     )
 
     # 2.4 Height extrapolation
@@ -764,24 +769,35 @@ def _pages_methodology(pdf, has_density, has_aep, has_subhourly, page_counter):
             "h_hub = hub height [m], V₁₀₀ = ERA5 100 m wind speed [m/s]")
 
     y = _para(fig, y,
-        "The shear exponent α is not a single constant. It varies systematically with the "
-        "hour of day, reflecting the diurnal cycle of atmospheric stability. During the day, "
-        "convective mixing reduces wind shear (α decreases); at night, stable stratification "
-        "increases it (α increases). The diurnal profile of α is derived from the ERA5 "
-        "10 m / 100 m wind speed ratio:"
+        "The shear exponent alpha is not a single constant. It varies per timestep to "
+        "capture individual atmospheric stability episodes. The long-term mean alpha is "
+        "anchored to GWA statistics:"
     )
     y = _eq(fig, y,
-            "α_diurnal(h)  =  ln(V₁₀₀ / V₁₀)  /  ln(100/10)",
-            "applied hourly and smoothed; then normalised so that mean(α_diurnal) = α_mean")
+            "alpha_mean  =  ln(V_GWA_hub / V_GWA_100)  /  ln(h_hub / 100)",
+            "calibrates mean shear to the locally-resolved GWA wind profile")
 
     y = _para(fig, y,
-        "The magnitude of α_mean is calibrated to the GWA statistics by computing the ratio "
-        "of GWA mean wind speeds at 100 m and hub height. This ensures the long-term mean "
-        "shear is consistent with the locally-calibrated GWA values, while the diurnal shape "
-        "comes from ERA5:"
+        "Per-timestep shear variation is then computed from the ERA5 boundary layer height "
+        "(BLH) as the primary stability signal. The stability index SI(t) = h_hub / BLH(t) "
+        "captures the physical mechanism: when BLH is below hub height (SI > 1) the rotor "
+        "is above the stable nocturnal boundary layer (low-level jet regime) and shear is "
+        "strong; when BLH greatly exceeds hub height (SI << 1) the atmosphere is well-mixed "
+        "and shear is low. The per-timestep shear exponent is:"
     )
     y = _eq(fig, y,
-            "α_mean  =  ln(V_GWA_hub / V_GWA_100)  /  ln(h_hub / 100)")
+            "alpha(t)  =  alpha_mean  +  s * sigma_alpha * SI_norm(t)   [clipped]",
+            "s = amplitude scale (default 1.0); sigma_alpha = std of ERA5 instantaneous "
+            "10-100m shear; SI_norm = zero-mean unit-std normalised stability index")
+
+    y = _para(fig, y,
+        "Unlike an hour-of-day grouping, this per-timestep approach captures episode-specific "
+        "stability: the same clock hour in winter can produce very different shear depending "
+        "on whether BLH is 50 m (calm clear-sky, NLLJ regime, high alpha) or 800 m (deep "
+        "frontal mixing, low alpha). If BLH is unavailable from the API, the tool falls back "
+        "to deriving the diurnal alpha profile from the ERA5 10 m / 100 m wind speed ratio "
+        "grouped by hour of day, normalised to alpha_mean."
+    )
 
     y -= 0.010
     y = _h1(fig, y, "Weibull Distribution Bias Correction", number="2.5")
