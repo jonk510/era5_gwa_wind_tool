@@ -107,6 +107,48 @@ def _detect_model_tz(series: pd.Series) -> str:
     return "local time (timezone unknown)"
 
 
+def _scan_tz_offsets(model: pd.Series, meas: pd.Series) -> pd.Series:
+    """
+    Sweep measured timestamp shift from -14 to +14 h in 0.5 h steps.
+    Returns a Series indexed by offset (hours) containing hourly Pearson r.
+    The offset with the highest r is the suggested timezone alignment.
+    """
+    m_h = model.copy()
+    if m_h.index.tz is not None:
+        m_h = m_h.tz_localize(None)
+    m_h  = m_h.resample("h").mean().dropna()
+    ms_h = meas.resample("h").mean().dropna()
+
+    offsets = np.arange(-14.0, 14.5, 0.5)
+    results = {}
+    for offset in offsets:
+        shifted = ms_h.copy()
+        shifted.index = shifted.index + pd.Timedelta(hours=float(offset))
+        idx = m_h.index.intersection(shifted.index)
+        if len(idx) < 24 * 14:          # need at least 2 weeks
+            results[float(offset)] = np.nan
+        else:
+            results[float(offset)] = float(m_h.loc[idx].corr(shifted.loc[idx]))
+    return pd.Series(results, name="r")
+
+
+def _chart_tz_scan(r_series: pd.Series, best_offset: float) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(6.5, 2.8))
+    valid = r_series.dropna()
+    ax.plot(valid.index, valid.values, color="#0F172A", lw=1.5, zorder=3)
+    ax.axvline(best_offset, color="#4F46E5", lw=1.8, ls="--", zorder=4,
+               label=f"Best: {best_offset:+.1f} h  (r = {r_series.loc[best_offset]:.3f})")
+    ax.axvline(0.0, color="#94A3B8", lw=1.0, ls=":", zorder=2, label="No shift (0 h)")
+    ax.set_xlabel("Shift applied to measured timestamps (hours)")
+    ax.set_ylabel("Pearson r (hourly)")
+    ax.set_title("Correlation vs timezone offset — auto scan", fontweight="bold")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.2)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
 def _find_overlap(
     model: pd.Series, meas: pd.Series, meas_shift_hours: float = 0.0
 ) -> tuple[pd.Series, pd.Series]:
@@ -609,23 +651,68 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Run offset scan (cached per dataset pair)
+scan_key = f"_tz_scan_{model_label}_{len(model_full)}_{int(model_full.mean()*100)}_{len(meas_full)}_{int(meas_full.mean()*100)}"
+if scan_key not in st.session_state:
+    with st.spinner("Scanning timezone offsets (−14 to +14 h)…"):
+        st.session_state[scan_key] = _scan_tz_offsets(model_full, meas_full)
+
+r_scan      = st.session_state[scan_key]
+best_offset = float(r_scan.idxmax())
+best_r      = float(r_scan.max())
+r_at_zero   = float(r_scan.get(0.0, np.nan))
+
+# Show scan chart
+fig_scan = _chart_tz_scan(r_scan, best_offset)
+st.pyplot(fig_scan)
+plt.close(fig_scan)
+
+# Interpret the result
+if abs(best_offset) < 0.25:
+    st.markdown(
+        f'<div class="good">✓ Peak correlation at <b>0 h shift</b> (r = {best_r:.3f}) — '
+        "timezones appear aligned. No adjustment needed.</div>",
+        unsafe_allow_html=True,
+    )
+elif best_offset % 1.0 != 0.0:
+    # Non-integer hour — could be genuine ERA5 timing lag, not just timezone
+    st.markdown(
+        f'<div class="warn">⚠️ Suggested shift: <b>{best_offset:+.1f} h</b> (r = {best_r:.3f} vs '
+        f'r = {r_at_zero:.3f} at 0 h). The non-integer offset may reflect a genuine '
+        "timing lag in ERA5 mesoscale events rather than a timezone issue — consider "
+        "rounding to the nearest whole hour for timezone correction only.</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f'<div class="warn">⚠️ Suggested shift: <b>{best_offset:+.1f} h</b> (r = {best_r:.3f} vs '
+        f'r = {r_at_zero:.3f} at 0 h). Enter this in the field below to align the timestamps.</div>',
+        unsafe_allow_html=True,
+    )
+
+# Pre-populate shift input with suggested value on first load
+_shift_init_key = f"_shift_init_{scan_key}"
+if _shift_init_key not in st.session_state:
+    st.session_state["calib_tz_shift"] = best_offset
+    st.session_state[_shift_init_key]  = True
+
 meas_shift = st.number_input(
     "Shift measured timestamps by (hours)",
     min_value=-14.0,
     max_value=14.0,
-    value=0.0,
+    value=st.session_state.get("calib_tz_shift", best_offset),
     step=0.5,
     key="calib_tz_shift",
     help=(
-        "Add this many hours to the measured timestamps before matching with the model. "
-        "Example: if the model is UTC+8 local time and your logger records in UTC, "
-        "set this to +8. If both are already in the same timezone, leave at 0."
+        "Add this many hours to measured timestamps before matching with the model. "
+        "Pre-filled with the scan suggestion above. "
+        "Example: if model is UTC+8 and logger records UTC, set to +8."
     ),
 )
 if meas_shift != 0.0:
     st.markdown(
-        f'<div class="warn">⚠️ Measured timestamps will be shifted by '
-        f'<b>{meas_shift:+.1f} h</b> before overlap matching.</div>',
+        f'<div class="warn">Measured timestamps shifted by <b>{meas_shift:+.1f} h</b> '
+        "before overlap matching.</div>",
         unsafe_allow_html=True,
     )
 
