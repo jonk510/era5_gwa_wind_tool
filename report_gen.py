@@ -634,7 +634,8 @@ def _pages_introduction(pdf, start_year, end_year, page_counter):
     page_counter[0] = pg + 1
 
 
-def _pages_methodology(pdf, has_density, has_aep, has_subhourly, page_counter):
+def _pages_methodology(pdf, has_density, has_aep, has_subhourly, page_counter,
+                        calib_meta: dict | None = None):
     def _new_page(section_title, subtitle=""):
         nonlocal fig, y
         pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
@@ -891,9 +892,79 @@ def _pages_methodology(pdf, has_density, has_aep, has_subhourly, page_counter):
             "are set to zero for nameplate ≤ 8 MW (single turbine, no self-wake)."
         )
 
+    # 2.9 — Measurement calibration (only printed when calibration was applied)
+    if calib_meta:
+        s_val   = calib_meta.get("amplitude_scale", 1.0)
+        k_val   = calib_meta.get("mean_multiplier", 1.0)
+        s_app   = calib_meta.get("s_applied", False)
+        k_app   = calib_meta.get("k_applied", False)
+        site_lb = calib_meta.get("site_label", "")
+        quality = calib_meta.get("rep_quality", "").replace("_", " ")
+        rmse_b  = calib_meta.get("rmse_before", None)
+        rmse_a  = calib_meta.get("rmse_after",  None)
+        if y < 0.30:
+            _new_page("2.  Methodology — Measurement Calibration",
+                      "Post-pipeline correction from concurrent site measurements")
+        y -= 0.010
+        y = _h1(fig, y, "Measurement-Based Calibration", number="2.9")
+        y -= 0.005
+        y = _para(fig, y,
+            "Where concurrent site measurements were available, two post-pipeline "
+            "correction factors were derived and applied to the full long-term synthetic "
+            "time series. Both factors were calibrated using ONLY the period during which "
+            "model output and measurements overlap in time."
+        )
+        y -= 0.004
+        # Step 1 — amplitude
+        s_label = f"[applied, s = {s_val:.3f}]" if s_app else f"[NOT applied, s = {s_val:.3f} derived]"
+        fig.text(ML, y, f"Step A — Amplitude scale {s_label}",
+                 fontsize=9, color=C_NAVY, fontweight="bold", va="top")
+        y -= 0.016
+        y = _para(fig, y,
+            "The diurnal amplitude scale (s) corrects the day/night wind speed swing "
+            "without changing the long-term mean. It is optimised to minimise the RMSE "
+            "between the modelled and measured 24-hour mean diurnal profiles over the "
+            "concurrent overlap period:",
+            indent=0.015,
+        )
+        y = _eq(fig, y,
+                "ws_corr(t)  =  diurnal_mean(h)  +  s × (ws(t) − diurnal_mean(h))",
+                "diurnal_mean(h) = long-term mean wind speed at clock hour h. "
+                "This step does not change the long-term mean.")
+        if rmse_b is not None and rmse_a is not None:
+            y = _para(fig, y,
+                f"Diurnal RMSE before: {rmse_b:.4f} m/s  →  after: {rmse_a:.4f} m/s "
+                f"({(rmse_b - rmse_a) / rmse_b * 100:.1f}% reduction, overlap period).",
+                indent=0.015, size=8.0)
+
+        # Step 2 — mean multiplier
+        k_label = f"[applied, k = {k_val:.4f}]" if k_app else f"[NOT applied, k = {k_val:.4f} derived]"
+        y -= 0.004
+        fig.text(ML, y, f"Step B — Mean multiplier {k_label}",
+                 fontsize=9, color=C_NAVY, fontweight="bold", va="top")
+        y -= 0.016
+        y = _para(fig, y,
+            "The mean multiplier (k) adjusts the overall mean wind speed level to "
+            "match the measured mean over the concurrent overlap period. It is applied "
+            "after the amplitude scale step:",
+            indent=0.015,
+        )
+        y = _eq(fig, y,
+                "ws_final(t)  =  ws_corr(t)  ×  k",
+                "k = mean(measured_overlap) / mean(ws_corr_overlap). Changes the long-term mean.")
+
+        y -= 0.004
+        y = _para(fig, y,
+            f"Calibration coverage: {quality}. "
+            "Correction factors are treated as stationary site properties (roughness, "
+            "terrain shear bias) and applied to the full long-term synthetic record "
+            f"for site {site_lb}. "
+            "The corrected CSV output documents all calibration parameters in its header."
+        )
+
     if has_subhourly:
         y -= 0.010
-        y = _h1(fig, y, "Sub-hourly Disaggregation", number="2.9")
+        y = _h1(fig, y, "Sub-hourly Disaggregation", number="2.10" if calib_meta else "2.9")
         y -= 0.005
         y = _para(fig, y,
             "When 30-minute or 10-minute output is requested, the hourly ERA5+GWA values are "
@@ -1286,6 +1357,7 @@ def generate_pdf_report(
     pc_df,
     start_year: int,
     end_year: int,
+    calib_meta: dict | None = None,
 ) -> bytes:
     """
     Generate a professional multi-page PDF wind resource assessment report.
@@ -1298,6 +1370,9 @@ def generate_pdf_report(
         wake_df      : wake loss DataFrame (or None)
         pc_df        : power curve DataFrame (or None)
         start_year / end_year : ERA5 period
+        calib_meta   : dict with calibration details (optional). Keys:
+                         amplitude_scale, mean_multiplier, s_applied, k_applied,
+                         site_label, rep_quality, rmse_before, rmse_after
     Returns:
         PDF bytes
     """
@@ -1329,7 +1404,7 @@ def generate_pdf_report(
 
         # 4 — Methodology
         pc[0] += 1
-        _pages_methodology(pdf, has_density, has_aep, has_subhourly, pc)
+        _pages_methodology(pdf, has_density, has_aep, has_subhourly, pc, calib_meta)
 
         # 5 — Site location map
         pc[0] += 1

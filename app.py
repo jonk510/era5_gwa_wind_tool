@@ -1175,24 +1175,44 @@ site measurements are available (see *Calibration* below).
 
 ### Calibration against site measurements
 
-A standalone script `calibrate.py` is provided in the tool directory for fitting the
-diurnal amplitude scale against site mast or LiDAR measurements. It requires:
+A dedicated **Calibration page** is available in the tool's sidebar navigation. It provides
+a full measurement-based calibration workflow directly in the browser, with charts and a
+corrected CSV download.
 
-- A measured wind speed CSV (any datetime-indexed format)
-- The tool's hourly output CSV for the same site
+**What it does:**
 
-Usage:
-```
-python calibrate.py --measured measured.csv --modelled model_output.csv [--plot]
-```
+The calibration compares the synthetic model output against concurrent site measurements
+(mast or LiDAR) to derive two correction factors, applied in sequence to the full
+long-term synthetic record:
 
-The script aligns both records to a common hourly index, then uses `scipy.optimize`
-(bounded 1-D minimisation) to find the `amplitude_scale` that minimises the RMSE between
-the measured and modelled 24-hour mean diurnal wind speed profiles. With `--plot` it saves
-a comparison chart and the RMSE-vs-scale curve as `calibration_result.png`.
+1. **Amplitude scale (s):** tunes the day/night diurnal wind speed swing without changing
+   the long-term mean. Found by minimising RMSE between the measured and modelled 24-hour
+   mean diurnal profiles over the concurrent overlap period.
+   > `ws_corr(t) = diurnal_mean(h) + s × (ws(t) − diurnal_mean(h))`
 
-The optimal scale value is reported at the end and can be directly entered into the
-Advanced settings panel without re-running the ERA5 fetch or GWA correction.
+2. **Mean multiplier (k):** corrects any remaining mean speed bias after the amplitude
+   step. Derived as the ratio of measured to corrected model mean on the overlap period.
+   > `ws_final(t) = ws_corr(t) × k`
+
+**Key design principle — concurrent overlap only:**
+Not all measurement records are long enough to be seasonally representative. The
+calibration uses **only the period when model and measurements overlap in time**. The
+resulting correction factors are treated as stationary site properties (roughness and
+terrain bias) and applied to the full long-term synthetic output. The page flags:
+
+- Records with less than 6–12 months of coverage (seasonal uncertainty)
+- Overlap periods where the model mean differs from the long-term model mean by more than
+  10% (indicating the measurement period may have been an unusually high/low wind year,
+  which would bias the mean multiplier)
+
+**Cross-site transfer:** For sites without measurements, the amplitude scale calibrated at
+a measured site can be used as a regional starting point — it reflects ERA5's systematic
+underestimation of stability-driven shear variability in the region. Enter it in the main
+tool's *Advanced settings → Diurnal amplitude scale*. The mean multiplier is site-specific
+and should not be transferred.
+
+A command-line version `calibrate.py` is also available in the tool directory for
+scripted workflows.
 
 ---
 
