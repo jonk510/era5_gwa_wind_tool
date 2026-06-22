@@ -60,7 +60,8 @@ def _load_series(f, ws_col: str | None = None) -> tuple[pd.Series | None, str]:
     """
     Load a wind speed Series from a Streamlit UploadedFile.
     Handles '#' comment headers and auto-detects wind speed column.
-    Returns (series, column_name) or (None, "").
+    Returns (series_with_naive_index, column_name) or (None, "").
+    Timezone info is stripped — caller is responsible for alignment.
     """
     try:
         raw  = f.read()
@@ -92,11 +93,41 @@ def _load_series(f, ws_col: str | None = None) -> tuple[pd.Series | None, str]:
     return s.rename("wind_speed"), col
 
 
-def _find_overlap(model: pd.Series, meas: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Resample both to hourly means and align on the common timestamp index."""
-    m_h  = model.resample("h").mean().dropna()
+def _detect_model_tz(series: pd.Series) -> str:
+    """
+    Return a human-readable timezone label for the model series.
+    Session state data is timezone-aware local time; CSV uploads are naive local time.
+    """
+    if series.index.tz is not None:
+        return str(series.index.tz)
+    # Try reading timezone from the index name (e.g. "datetime_UTC+08:00")
+    name = str(series.index.name or "")
+    if "UTC" in name:
+        return name.split("datetime_")[-1] if "datetime_" in name else name
+    return "local time (timezone unknown)"
+
+
+def _find_overlap(
+    model: pd.Series, meas: pd.Series, meas_shift_hours: float = 0.0
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Resample both to hourly means, optionally shift measured timestamps by
+    meas_shift_hours, then align on the common timestamp index.
+
+    meas_shift_hours: hours to ADD to measured timestamps so they align with
+    the model's local time.  e.g. if model is UTC+8 local time and measured
+    is UTC, set meas_shift_hours = +8.
+    """
+    m_h  = model.copy()
+    if m_h.index.tz is not None:          # strip tz for naive comparison
+        m_h = m_h.tz_localize(None)
+    m_h  = m_h.resample("h").mean().dropna()
+
     ms_h = meas.resample("h").mean().dropna()
-    idx  = m_h.index.intersection(ms_h.index)
+    if meas_shift_hours != 0.0:
+        ms_h.index = ms_h.index + pd.Timedelta(hours=meas_shift_hours)
+
+    idx = m_h.index.intersection(ms_h.index)
     return m_h.loc[idx], ms_h.loc[idx]
 
 
@@ -427,6 +458,11 @@ page flags both risks:
   long-term model mean by more than 10%, the mean multiplier (k) may carry a
   wind-year bias component. In that case, consider applying only the amplitude scale.
 
+**Timezone:** the model output is in **local time** (the tool converts ERA5 UTC to the
+site's local timezone before all processing, so diurnal hour grouping is physically
+correct). Your measured data must be in the same timezone, or you must apply the
+"Shift measured timestamps" offset below to align them before overlap matching.
+
 **Cross-site transfer:** the amplitude scale (s) reflects ERA5's systematic
 underestimation of stability-driven shear variability and is moderately transferable
 to nearby sites with similar terrain. The mean multiplier (k) is site-specific
@@ -553,9 +589,43 @@ if model_full is None or meas_full is None:
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Timezone alignment
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("### Timezone alignment")
+
+model_tz_label = _detect_model_tz(model_full)
+st.markdown(
+    f'<div class="info">ℹ️ Model timestamps are in <b>{model_tz_label}</b>. '
+    "The tool converts ERA5 (UTC) to local time before processing, so the model output "
+    "CSV and session state data are both in <b>local time</b>. "
+    "Your measured data must use the same timezone for the overlap to align correctly.</div>",
+    unsafe_allow_html=True,
+)
+
+meas_shift = st.number_input(
+    "Shift measured timestamps by (hours)",
+    min_value=-14.0,
+    max_value=14.0,
+    value=0.0,
+    step=0.5,
+    key="calib_tz_shift",
+    help=(
+        "Add this many hours to the measured timestamps before matching with the model. "
+        "Example: if the model is UTC+8 local time and your logger records in UTC, "
+        "set this to +8. If both are already in the same timezone, leave at 0."
+    ),
+)
+if meas_shift != 0.0:
+    st.markdown(
+        f'<div class="warn">⚠️ Measured timestamps will be shifted by '
+        f'<b>{meas_shift:+.1f} h</b> before overlap matching.</div>',
+        unsafe_allow_html=True,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Find concurrent overlap
 # ─────────────────────────────────────────────────────────────────────────────
-model_ov, meas_ov = _find_overlap(model_full, meas_full)
+model_ov, meas_ov = _find_overlap(model_full, meas_full, meas_shift_hours=meas_shift)
 
 if len(model_ov) < 24 * 7:
     st.error(
