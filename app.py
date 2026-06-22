@@ -546,6 +546,7 @@ def run_pipeline(
     hub_height: float = 150.0,
     elevation: float = 0.0,
     amplitude_scale: float = 1.0,
+    mean_multiplier: float = 1.0,
     alpha_clip_lo: float = 0.02,
     alpha_clip_hi: float = 1.0,
     alpha_mean_lo: float = 0.03,
@@ -558,6 +559,7 @@ def run_pipeline(
       3. Extrapolate ERA5 100m → hub_height with diurnal alpha.
       4. Fit Weibull to ERA5 hub_height estimate.
       5. Apply Weibull quantile transform to match GWA hub_height Weibull.
+      5b. Apply amplitude_scale (diurnal deviation scaling) and mean_multiplier post-Weibull.
       6. Compute per-timestep air density at hub height from ERA5 T₂ₘ + ISA lapse.
 
     Returns (df, meta). Internal df columns ws_150m_raw / ws_150m_corrected
@@ -622,7 +624,7 @@ def run_pipeline(
         si = (hub_height / blh_filled).clip(0.0, 5.0)
         si_std = float(si.std())
         si_norm = (si - si.mean()) / si_std if si_std > 1e-6 else pd.Series(0.0, index=df.index)
-        df["alpha_h"] = (alpha_mean + amplitude_scale * alpha_std_era5 * si_norm).clip(
+        df["alpha_h"] = (alpha_mean + alpha_std_era5 * si_norm).clip(
             alpha_clip_lo, alpha_clip_hi
         )
         alpha_method = "ERA5 boundary layer height (per-timestep)"
@@ -635,7 +637,7 @@ def run_pipeline(
                 .reindex(range(24), fill_value=alpha_mean)
             )
             deviation = diurnal_era5 - diurnal_era5.mean()
-            diurnal_scaled = (alpha_mean + amplitude_scale * deviation).clip(
+            diurnal_scaled = (alpha_mean + deviation).clip(
                 alpha_clip_lo, alpha_clip_hi
             )
         else:
@@ -658,6 +660,16 @@ def run_pipeline(
         df["ws_150m_corrected"] = df["ws_150m_raw"].clip(lower=0)
     else:
         df["ws_150m_corrected"] = A_gwa_hub * (v / A_era5_150) ** (k_era5_150 / k_gwa_hub)
+
+    # ── Step 5b: Calibration corrections (applied post-Weibull) ─────────────
+    # These match exactly what the Calibration page computes, so entering
+    # the values from the parameter file reproduces the calibrated CSV.
+    if amplitude_scale != 1.0:
+        ws = df["ws_150m_corrected"]
+        dm = ws.groupby(ws.index.hour).transform("mean")
+        df["ws_150m_corrected"] = (dm + amplitude_scale * (ws - dm)).clip(lower=0)
+    if mean_multiplier != 1.0:
+        df["ws_150m_corrected"] = (df["ws_150m_corrected"] * mean_multiplier).clip(lower=0)
 
     # ── Step 6: Air density at hub height ────────────────────────────────────
     # Hub height above sea level determines both pressure and temperature.
@@ -1419,15 +1431,29 @@ with st.sidebar:
             "Adjust diurnal shear amplitude and α bounds. Leave at defaults unless "
             "calibrating against site measurements."
         )
-        amplitude_scale = st.slider(
-            "Diurnal amplitude scale",
-            min_value=0.5, max_value=3.0, value=1.0, step=0.05,
-            help=(
-                "Multiplies the per-timestep α deviation from the long-term mean. "
-                "1.0 = ERA5 native amplitude. Increase (e.g. 1.3–1.6) if measured "
-                "diurnal variation exceeds model output."
-            ),
-        )
+        _amp_c1, _amp_c2 = st.columns(2)
+        with _amp_c1:
+            amplitude_scale = st.number_input(
+                "Diurnal amplitude scale (s)",
+                min_value=0.3, max_value=4.0, value=1.0, step=0.001, format="%.3f",
+                help=(
+                    "Scales each timestep's deviation from its hourly diurnal mean. "
+                    "Applied post-Weibull: ws_corr = dm(h) + s × (ws − dm(h)). "
+                    "s > 1 → larger day/night swing; s < 1 → flatter. Does not change "
+                    "long-term mean. Enter value from Calibration page parameter file."
+                ),
+            )
+        with _amp_c2:
+            mean_multiplier = st.number_input(
+                "Mean wind speed multiplier (k)",
+                min_value=0.5, max_value=2.0, value=1.0, step=0.001, format="%.4f",
+                help=(
+                    "Multiplies all wind speeds after diurnal correction. "
+                    "k > 1 if model underestimates mean; k < 1 if overestimating. "
+                    "Changes long-term mean. Enter value from Calibration page parameter file. "
+                    "Leave at 1.0 unless you have measured data to calibrate against."
+                ),
+            )
         _adv_c1, _adv_c2 = st.columns(2)
         with _adv_c1:
             alpha_clip_lo = st.number_input(
@@ -1570,8 +1596,9 @@ if app_mode == "Batch":
                                 _b_df_era5 = localise_df(_b_era5, _b_tz_disp)
                                 _b_df, _b_meta = run_pipeline(
                                     _b_df_era5, _b_gwc, _b_heights, hub_height=_b_hub_h, elevation=_b_elevation,
-                                    amplitude_scale=amplitude_scale, alpha_clip_lo=alpha_clip_lo,
-                                    alpha_clip_hi=alpha_clip_hi, alpha_mean_lo=alpha_mean_lo, alpha_mean_hi=alpha_mean_hi,
+                                    amplitude_scale=amplitude_scale, mean_multiplier=mean_multiplier,
+                                    alpha_clip_lo=alpha_clip_lo, alpha_clip_hi=alpha_clip_hi,
+                                    alpha_mean_lo=alpha_mean_lo, alpha_mean_hi=alpha_mean_hi,
                                 )
                                 _b_tz_sfx = f"UTC{_tz_offset_str(_b_df.index)}" if _b_tz_disp != "UTC" else "UTC"
 
@@ -2007,8 +2034,9 @@ if run_btn:
         with st.spinner("Running processing pipeline…"):
             df, meta = run_pipeline(
                 df_era5, gwc, heights, hub_height=hub_height, elevation=site_elevation,
-                amplitude_scale=amplitude_scale, alpha_clip_lo=alpha_clip_lo,
-                alpha_clip_hi=alpha_clip_hi, alpha_mean_lo=alpha_mean_lo, alpha_mean_hi=alpha_mean_hi,
+                amplitude_scale=amplitude_scale, mean_multiplier=mean_multiplier,
+                alpha_clip_lo=alpha_clip_lo, alpha_clip_hi=alpha_clip_hi,
+                alpha_mean_lo=alpha_mean_lo, alpha_mean_hi=alpha_mean_hi,
             )
 
         if meta.get("alpha_raw", meta["alpha_mean"]) != meta["alpha_mean"]:

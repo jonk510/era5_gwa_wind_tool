@@ -425,31 +425,27 @@ def _build_params_file(
         "",
         "  AMPLITUDE SCALE (s):",
         f"    Value: {result['amplitude_scale']:.4f}",
-        "    Where: Main tool > Advanced settings > Diurnal amplitude scale",
-        "    Effect: Adjusts day/night wind speed swing without changing the",
-        "            long-term mean. Re-running the main tool with this value",
-        "            gives a similar but NOT identical result to the calibrated",
-        "            CSV, because the main tool applies s inside the BLH",
-        "            stability formula upstream of the Weibull transform,",
-        "            while this page approximates it as a direct deviation",
-        "            scaling on the already-corrected output.",
+        "    Where: Main tool > Advanced settings > Diurnal amplitude scale (s)",
+        "    Effect: Scales each timestep's deviation from its hourly diurnal mean.",
+        "            Formula: ws_corr = dm(h) + s × (ws − dm(h))",
+        "            s > 1 → larger day/night swing; s < 1 → flatter profile.",
+        "            Does not change long-term mean.",
         "    Cross-site: Moderately transferable to nearby sites with similar",
         "            terrain and stability regime.",
         "",
         "  MEAN MULTIPLIER (k):",
         f"    Value: {result['mean_multiplier']:.6f}",
-        "    Where: No equivalent parameter in the main tool.",
-        "            This correction can only be applied on the Calibration",
-        "            page — it is a post-pipeline step not yet wired into",
-        "            the main tool's Advanced settings.",
-        "    Effect: Scales all wind speeds to match measured long-term mean.",
+        "    Where: Main tool > Advanced settings > Mean wind speed multiplier (k)",
+        "    Effect: Multiplies all wind speeds after diurnal correction.",
+        "            k > 1 → model underestimated mean; k < 1 → overestimated.",
+        "            Changes long-term mean.",
         "    Cross-site: Site-specific. DO NOT transfer to other sites.",
         "",
-        "  RECOMMENDATION:",
-        "    The calibrated CSV downloaded from this page is the definitive,",
-        "    reproducible output with both corrections applied exactly as shown.",
-        "    Use the parameter file to document the calibration, transfer the",
-        "    amplitude scale to unmeasured sites, and record what was done.",
+        "  REPRODUCIBILITY:",
+        "    Both corrections are applied post-Weibull in the main tool using",
+        "    the identical formula to this Calibration page. Entering s and k",
+        "    from this file into the main tool's Advanced settings and",
+        "    re-running will produce output IDENTICAL to the calibrated CSV.",
         "",
         "=" * W,
     ]
@@ -1019,12 +1015,10 @@ with dl2:
     )
 
 st.markdown(
-    '<div class="info">ℹ️ <b>Note on reproducibility:</b> The calibrated CSV above is the '
-    "definitive output with both corrections applied exactly. Re-running the main tool "
-    "with the amplitude scale (s) from the parameter file will give a <i>similar but not "
-    "identical</i> result — the main tool applies s upstream of the Weibull transform, "
-    "which is slightly different to this page's post-hoc approximation. "
-    "The mean multiplier (k) has no equivalent in the main tool's current settings.</div>",
+    '<div class="good">✓ <b>Fully reproducible:</b> Both corrections are applied post-Weibull '
+    "using the same formula in the main tool and this page. Enter s and k from the parameter "
+    "file into <b>Advanced settings</b> in the main tool and re-run — you will get output "
+    "identical to the calibrated CSV above.</div>",
     unsafe_allow_html=True,
 )
 
@@ -1053,8 +1047,8 @@ here may be a useful starting point:
 
 | Parameter | Calibrated value | Transferability |
 |-----------|-----------------|----------------|
-| **Amplitude scale (s)** | **{s_opt:.2f}** | Moderately transferable to nearby sites with similar terrain, fetch, and stability regime. Enter in *Advanced settings → Diurnal amplitude scale* in the main tool. |
-| **Mean multiplier (k)** | **{k_opt:.4f}** | Site-specific (roughness + terrain bias). **Do not transfer** to other sites without separate validation. |
+| **Amplitude scale (s)** | **{s_opt:.2f}** | Moderately transferable to nearby sites with similar terrain, fetch, and stability regime. Enter in *Advanced settings → Diurnal amplitude scale (s)* in the main tool. |
+| **Mean multiplier (k)** | **{k_opt:.4f}** | Site-specific (roughness + terrain bias). **Do not transfer** to other sites. Enter in *Advanced settings → Mean wind speed multiplier (k)* only for this site. |
 
 Transferability of the amplitude scale depends on:
 - Terrain similarity (coastal vs inland, flat vs complex)
