@@ -359,6 +359,104 @@ def _chart_coverage(rep: dict) -> plt.Figure:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Parameter file builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_params_file(
+    site_label: str,
+    rep: dict,
+    result: dict,
+    s_use: float,
+    k_use: float,
+    apply_amp: bool,
+    apply_mean: bool,
+    meas_shift: float,
+    original_mean: float,
+    corrected_mean: float,
+    hub_h,
+) -> bytes:
+    """Build a human-readable plain-text parameter file for the calibration results."""
+    missing_str = (
+        ", ".join(MONTH_NAMES[m - 1] for m in rep["missing"]) if rep["missing"] else "none"
+    )
+    W = 65  # line width for separator
+    lines = [
+        "=" * W,
+        "  ERA5 × GWA Wind Tool — Calibration Parameters",
+        "=" * W,
+        f"  Site:        {site_label}",
+        f"  Hub height:  {hub_h} m",
+        f"  Generated:   {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "-" * W,
+        "  CALIBRATION PERIOD",
+        "-" * W,
+        f"  Overlap:         {rep['start'].strftime('%Y-%m-%d')} to {rep['end'].strftime('%Y-%m-%d')}",
+        f"  Duration:        {rep['n_cal_months']} calendar months  ({rep['n_hours']:,} hourly records)",
+        f"  Coverage:        {rep['quality'].replace('_', ' ')}",
+        f"  Missing months:  {missing_str}",
+        f"  Measured mean (overlap):      {result['mean_meas']:.3f} m/s",
+        f"  Model mean (overlap):         {rep['ov_mean']:.3f} m/s",
+        f"  Model mean (long-term):       {rep['full_mean']:.3f} m/s",
+        f"  Concurrent / long-term ratio: {rep['rep_ratio']:.3f}",
+        f"  Timestamp shift applied:      {meas_shift:+.1f} h  (to measured data)",
+        "",
+        "-" * W,
+        "  QUALITY METRICS  (concurrent overlap period)",
+        "-" * W,
+        f"  Hourly Pearson r:      {result['r']:.4f}",
+        f"  R² (variance expl.):   {result['r2']:.4f}",
+        f"  Diurnal RMSE before:   {result['rmse_before']:.4f} m/s",
+        f"  Diurnal RMSE after:    {result['rmse_after']:.4f} m/s",
+        f"  RMSE improvement:      {(result['rmse_before']-result['rmse_after'])/result['rmse_before']*100:.1f}%",
+        "",
+        "-" * W,
+        "  CORRECTION FACTORS",
+        "-" * W,
+        f"  Amplitude scale  (s):   {result['amplitude_scale']:.4f}   {'[APPLIED]' if apply_amp else '[derived only — not applied]'}",
+        f"  Mean multiplier  (k):   {result['mean_multiplier']:.6f}   {'[APPLIED]' if apply_mean else '[derived only — not applied]'}",
+        "",
+        f"  Long-term mean (original):   {original_mean:.3f} m/s",
+        f"  Long-term mean (corrected):  {corrected_mean:.3f} m/s",
+        "",
+        "-" * W,
+        "  HOW TO USE THESE PARAMETERS",
+        "-" * W,
+        "",
+        "  AMPLITUDE SCALE (s):",
+        f"    Value: {result['amplitude_scale']:.4f}",
+        "    Where: Main tool > Advanced settings > Diurnal amplitude scale",
+        "    Effect: Adjusts day/night wind speed swing without changing the",
+        "            long-term mean. Re-running the main tool with this value",
+        "            gives a similar but NOT identical result to the calibrated",
+        "            CSV, because the main tool applies s inside the BLH",
+        "            stability formula upstream of the Weibull transform,",
+        "            while this page approximates it as a direct deviation",
+        "            scaling on the already-corrected output.",
+        "    Cross-site: Moderately transferable to nearby sites with similar",
+        "            terrain and stability regime.",
+        "",
+        "  MEAN MULTIPLIER (k):",
+        f"    Value: {result['mean_multiplier']:.6f}",
+        "    Where: No equivalent parameter in the main tool.",
+        "            This correction can only be applied on the Calibration",
+        "            page — it is a post-pipeline step not yet wired into",
+        "            the main tool's Advanced settings.",
+        "    Effect: Scales all wind speeds to match measured long-term mean.",
+        "    Cross-site: Site-specific. DO NOT transfer to other sites.",
+        "",
+        "  RECOMMENDATION:",
+        "    The calibrated CSV downloaded from this page is the definitive,",
+        "    reproducible output with both corrections applied exactly as shown.",
+        "    Use the parameter file to document the calibration, transfer the",
+        "    amplitude scale to unmeasured sites, and record what was done.",
+        "",
+        "=" * W,
+    ]
+    return "\n".join(lines).encode("utf-8")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSV builder
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -887,20 +985,47 @@ p2.metric(
 )
 p3.metric("Measured mean (overlap)", f"{float(meas_ov.mean()):.2f} m/s")
 
+slug      = model_label.replace(" ", "_").replace("/", "_")
+now_str   = datetime.now().strftime("%Y%m%d_%H%M")
+
 csv_bytes = _build_csv(
     final_series, model_label, rep, result,
     s_use, k_use, apply_amp, apply_mean,
     float(model_full.mean()), hub_h,
 )
-fname = (
-    f"calibrated_{model_label.replace(' ', '_').replace('/', '_')}"
-    f"_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+params_bytes = _build_params_file(
+    model_label, rep, result,
+    s_use, k_use, apply_amp, apply_mean,
+    meas_shift,
+    float(model_full.mean()), float(final_series.mean()), hub_h,
 )
-st.download_button(
-    "⬇ Download calibrated wind speed CSV",
-    data=csv_bytes,
-    file_name=fname,
-    mime="text/csv",
+
+dl1, dl2 = st.columns(2)
+with dl1:
+    st.download_button(
+        "⬇ Download calibrated wind speed CSV",
+        data=csv_bytes,
+        file_name=f"calibrated_{slug}_{now_str}.csv",
+        mime="text/csv",
+    )
+with dl2:
+    st.download_button(
+        "⬇ Download calibration parameters (.txt)",
+        data=params_bytes,
+        file_name=f"calib_params_{slug}_{now_str}.txt",
+        mime="text/plain",
+        help="Human-readable record of all calibration factors, quality metrics, "
+             "and guidance on where to enter each parameter in the main tool.",
+    )
+
+st.markdown(
+    '<div class="info">ℹ️ <b>Note on reproducibility:</b> The calibrated CSV above is the '
+    "definitive output with both corrections applied exactly. Re-running the main tool "
+    "with the amplitude scale (s) from the parameter file will give a <i>similar but not "
+    "identical</i> result — the main tool applies s upstream of the Weibull transform, "
+    "which is slightly different to this page's post-hoc approximation. "
+    "The mean multiplier (k) has no equivalent in the main tool's current settings.</div>",
+    unsafe_allow_html=True,
 )
 
 # Persist calibrated parameters in session state for cross-page reference
