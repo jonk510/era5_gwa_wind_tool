@@ -208,6 +208,10 @@ def _calibrate(model_ov: pd.Series, meas_ov: pd.Series) -> dict:
     rmse_a = _rmse_diurnal(s,   model_ov, meas_ov)
     scaled = _apply_amp(model_ov, s)
     k      = float(meas_ov.mean() / scaled.mean()) if float(scaled.mean()) > 0 else 1.0
+
+    # Pearson r: hourly timestep-by-timestep correlation on the overlap period
+    r = float(model_ov.corr(meas_ov))
+
     return dict(
         amplitude_scale=s,
         mean_multiplier=k,
@@ -216,6 +220,8 @@ def _calibrate(model_ov: pd.Series, meas_ov: pd.Series) -> dict:
         mean_meas=float(meas_ov.mean()),
         mean_model_raw=float(model_ov.mean()),
         mean_model_corrected=float(scaled.mean() * k),
+        r=r,
+        r2=r ** 2,
     )
 
 
@@ -356,6 +362,7 @@ def _build_csv(
         f"# Mean multiplier (k): {k_use:.6f}  {'[applied]' if apply_mean else '[NOT applied — k=1.0 used]'}",
         f"# Diurnal RMSE before: {result['rmse_before']:.4f} m/s  (overlap period)",
         f"# Diurnal RMSE after:  {result['rmse_after']:.4f} m/s  (overlap period)",
+        f"# Hourly correlation:  r = {result['r']:.4f},  R² = {result['r2']:.4f}  (overlap period)",
         "#",
         "# --- Method ---",
         "# Step 1 (amplitude): ws_corr(t) = diurnal_mean(h) + s * (ws(t) - diurnal_mean(h))",
@@ -704,7 +711,7 @@ result = st.session_state[calib_key]
 s_opt  = result["amplitude_scale"]
 k_opt  = result["mean_multiplier"]
 
-m1, m2, m3, m4, m5 = st.columns(5)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric(
     "Amplitude scale (s)", f"{s_opt:.3f}",
     help="s > 1 → larger day/night swing; s < 1 → flatter profile. Does not change long-term mean.",
@@ -720,8 +727,17 @@ m4.metric(
     delta_color="inverse",
 )
 m5.metric(
-    "Final corrected mean vs measured",
+    "Corrected mean vs measured",
     f"{result['mean_model_corrected']:.2f} vs {result['mean_meas']:.2f} m/s",
+)
+m6.metric(
+    "Correlation (r)",
+    f"{result['r']:.3f}",
+    help=(
+        "Pearson r between hourly model and measured wind speeds over the concurrent "
+        "overlap period. Measures how well ERA5 captures weather event timing. "
+        f"R² = {result['r2']:.3f} (proportion of variance explained)."
+    ),
 )
 
 corrected_full = _apply_corrections(model_full, s_opt, k_opt)
