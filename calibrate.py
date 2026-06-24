@@ -19,7 +19,7 @@ Measured CSV
       • WindPRO Meteo Data Export TXT (tab-separated, auto-detected)
 
 Modelled CSV
-    The tool's hourly output CSV for the same site (gwa_corrected_ws_*m_ms column).
+    The tool's hourly output CSV for the same site (ws_gwa_corrected_*m_ms column).
     The tool must have been run to produce this before calibrating.
 
 The script:

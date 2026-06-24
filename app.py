@@ -1647,7 +1647,7 @@ if app_mode == "Batch":
                                 ]) + "\n"
 
                                 _b_col_extrap = f"era5_ws_{_b_hh_int}m_extrap_ms"
-                                _b_col_corr = f"gwa_corrected_ws_{_b_hh_int}m_ms"
+                                _b_col_corr = f"ws_gwa_corrected_{_b_hh_int}m_ms"
 
                                 if _b_sub_df is not None:
                                     # Sub-hourly: corrected wind at sub-hourly res, hourly direction/density repeated
@@ -2683,7 +2683,7 @@ Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** (
 
         _hh_int = int(hub_height)
         _col_extrap = f"era5_ws_{_hh_int}m_extrap_ms"
-        _col_corr = f"gwa_corrected_ws_{_hh_int}m_ms"
+        _col_corr = f"ws_gwa_corrected_{_hh_int}m_ms"
 
         if df_sub is not None:
             # Sub-hourly speed + hourly direction repeated for each sub-hourly step

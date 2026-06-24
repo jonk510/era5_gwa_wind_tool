@@ -746,7 +746,7 @@ def _build_csv(
     buf = io.StringIO()
     for ln in lines:
         buf.write(ln + "\n")
-    col_ws  = f"calibrated_ws_{hub_h}m_ms"
+    col_ws  = f"ws_calibrated_{hub_h}m_ms"
     out_df  = final_series.round(2).to_frame(name=col_ws)
     if dir_series is not None:
         wd = dir_series.resample("h").mean().reindex(final_series.index, method="ffill")
