@@ -962,38 +962,50 @@ if scan_key not in st.session_state:
     with st.spinner("Scanning timezone offsets (−14 to +14 h)…"):
         st.session_state[scan_key] = _scan_tz_offsets(model_full, meas_full)
 
-r_scan      = st.session_state[scan_key]
-best_offset = float(r_scan.idxmax())
-best_r      = float(r_scan.max())
-r_at_zero   = float(r_scan.get(0.0, np.nan))
+r_scan = st.session_state[scan_key]
 
-# Show scan chart
-fig_scan = _chart_tz_scan(r_scan, best_offset)
-st.pyplot(fig_scan)
-plt.close(fig_scan)
-
-# Interpret the result
-if abs(best_offset) < 0.25:
+if r_scan.isna().all():
     st.markdown(
-        f'<div class="good">✓ Peak correlation at <b>0 h shift</b> (r = {best_r:.3f}) — '
-        "timezones appear aligned. No adjustment needed.</div>",
+        '<div class="warn">⚠️ Timezone scan could not find any offset with ≥ 2 weeks of '
+        "overlapping hourly data. Check that the model and measured records cover the same "
+        "calendar period. Defaulting to 0 h shift — adjust manually below if needed.</div>",
         unsafe_allow_html=True,
     )
-elif best_offset % 1.0 != 0.0:
-    # Non-integer hour — could be genuine ERA5 timing lag, not just timezone
-    st.markdown(
-        f'<div class="warn">⚠️ Suggested shift: <b>{best_offset:+.1f} h</b> (r = {best_r:.3f} vs '
-        f'r = {r_at_zero:.3f} at 0 h). The non-integer offset may reflect a genuine '
-        "timing lag in ERA5 mesoscale events rather than a timezone issue — consider "
-        "rounding to the nearest whole hour for timezone correction only.</div>",
-        unsafe_allow_html=True,
-    )
+    best_offset = 0.0
+    best_r      = float("nan")
+    r_at_zero   = float("nan")
 else:
-    st.markdown(
-        f'<div class="warn">⚠️ Suggested shift: <b>{best_offset:+.1f} h</b> (r = {best_r:.3f} vs '
-        f'r = {r_at_zero:.3f} at 0 h). Enter this in the field below to align the timestamps.</div>',
-        unsafe_allow_html=True,
-    )
+    best_offset = float(r_scan.idxmax())
+    best_r      = float(r_scan.max())
+    r_at_zero   = float(r_scan.get(0.0, np.nan))
+
+    # Show scan chart
+    fig_scan = _chart_tz_scan(r_scan, best_offset)
+    st.pyplot(fig_scan)
+    plt.close(fig_scan)
+
+# Interpret the result (only when scan succeeded)
+if not np.isnan(best_r):
+    if abs(best_offset) < 0.25:
+        st.markdown(
+            f'<div class="good">✓ Peak correlation at <b>0 h shift</b> (r = {best_r:.3f}) — '
+            "timezones appear aligned. No adjustment needed.</div>",
+            unsafe_allow_html=True,
+        )
+    elif best_offset % 1.0 != 0.0:
+        st.markdown(
+            f'<div class="warn">⚠️ Suggested shift: <b>{best_offset:+.1f} h</b> (r = {best_r:.3f} vs '
+            f'r = {r_at_zero:.3f} at 0 h). The non-integer offset may reflect a genuine '
+            "timing lag in ERA5 mesoscale events rather than a timezone issue — consider "
+            "rounding to the nearest whole hour for timezone correction only.</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="warn">⚠️ Suggested shift: <b>{best_offset:+.1f} h</b> (r = {best_r:.3f} vs '
+            f'r = {r_at_zero:.3f} at 0 h). Enter this in the field below to align the timestamps.</div>',
+            unsafe_allow_html=True,
+        )
 
 # Pre-populate shift input with suggested value on first load
 _shift_init_key = f"_shift_init_{scan_key}"
