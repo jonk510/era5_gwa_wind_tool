@@ -70,11 +70,13 @@ def _load_windpro_series(path: Path) -> pd.Series:
             tz_label = m.group(0)
 
     df = pd.read_csv(path, skiprows=6, header=None)
+    df = df[pd.to_numeric(df[0], errors="coerce").fillna(0) == 0]  # drop disabled rows
     df[1] = pd.to_datetime(df[1], format="%d/%m/%Y %H:%M", dayfirst=True)
     df = df.set_index(1)
     df.index.name = "datetime"
 
-    ws = pd.to_numeric(df[2], errors="coerce").dropna()
+    ws = pd.to_numeric(df[2], errors="coerce")
+    ws = ws[(ws >= 0.0) & (ws <= 75.0)].dropna()  # drop sentinels like 999/9999
     if tz_label:
         print(f"  WindPRO time-series export — timestamps are {tz_label}")
     return ws.rename("wind_speed")
@@ -122,7 +124,8 @@ def _load_windpro_meteo_series(path: Path) -> pd.Series:
     df["TimeStamp"] = pd.to_datetime(df["TimeStamp"], format="%Y-%m-%d %H:%M")
     df = df.set_index("TimeStamp")
 
-    ws = pd.to_numeric(df[ws_col], errors="coerce").dropna()
+    ws = pd.to_numeric(df[ws_col], errors="coerce")
+    ws = ws[(ws >= 0.0) & (ws <= 75.0)].dropna()  # drop sentinels like 999/9999
     if tz_label:
         print(f"  WindPRO Meteo Data Export — timestamps are {tz_label}")
     return ws.rename("wind_speed")

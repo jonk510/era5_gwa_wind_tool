@@ -89,10 +89,13 @@ def _load_windpro_series(raw: bytes) -> tuple[pd.Series | None, str]:
         df = pd.read_csv(io.BytesIO(raw), skiprows=6, header=None)
         # Cols: 0=disabled flag, 1=timestamp, 2=wind speed, 3=direction, ...
         df[1] = pd.to_datetime(df[1], format="%d/%m/%Y %H:%M", dayfirst=True)
+        # Drop disabled rows (col 0 != 0 means disabled in WindPRO)
+        df = df[pd.to_numeric(df[0], errors="coerce").fillna(0) == 0]
         df = df.set_index(1)
         df.index.name = "datetime"
 
-        ws = pd.to_numeric(df[2], errors="coerce").dropna()
+        ws = pd.to_numeric(df[2], errors="coerce")
+        ws = ws[(ws >= 0.0) & (ws <= 75.0)].dropna()  # drop sentinels like 999/9999
         ws.name = "wind_speed"
 
         col_label = f"Mean wind speed [{tz_label}]" if tz_label else "Mean wind speed"
@@ -154,7 +157,8 @@ def _load_windpro_meteo_series(raw: bytes) -> tuple[pd.Series | None, str]:
         df = df.set_index("TimeStamp")
         df.index.name = "datetime"
 
-        ws = pd.to_numeric(df[ws_col], errors="coerce").dropna()
+        ws = pd.to_numeric(df[ws_col], errors="coerce")
+        ws = ws[(ws >= 0.0) & (ws <= 75.0)].dropna()  # drop sentinels like 999/9999
         ws.name = "wind_speed"
 
         # Extract hub height from column name (e.g. "_125.0m_")
