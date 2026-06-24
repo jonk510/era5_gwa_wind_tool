@@ -1426,6 +1426,18 @@ with st.sidebar:
         help="Height for wind speed extrapolation and GWA Weibull correction. Used as the default in batch mode when no hub_height column is present.",
     )
     st.divider()
+    # Pre-populate calibration values into the Advanced settings widgets if fresh results exist
+    if st.session_state.get("_calib_pending"):
+        _s_pre = st.session_state.get("calib_s_opt", 1.0)
+        _k_pre = st.session_state.get("calib_k_opt", 1.0)
+        st.session_state["adv_amplitude_scale"] = float(_s_pre)
+        st.session_state["adv_mean_multiplier"] = float(_k_pre)
+        st.session_state["_calib_pending"] = False
+        st.success(
+            f"Calibration results loaded into Advanced settings  \n"
+            f"s = **{_s_pre:.3f}** · k = **{_k_pre:.4f}** "
+            f"(site: {st.session_state.get('calib_site_label', '—')})"
+        )
     with st.expander("⚙️ Advanced settings"):
         st.caption(
             "Adjust diurnal shear amplitude and α bounds. Leave at defaults unless "
@@ -1436,6 +1448,7 @@ with st.sidebar:
             amplitude_scale = st.number_input(
                 "Diurnal amplitude scale (s)",
                 min_value=0.3, max_value=4.0, value=1.0, step=0.001, format="%.3f",
+                key="adv_amplitude_scale",
                 help=(
                     "Scales each timestep's deviation from the long-term mean M. "
                     "Applied post-Weibull: ws_corr = M + s × (ws − M). "
@@ -1447,6 +1460,7 @@ with st.sidebar:
             mean_multiplier = st.number_input(
                 "Mean wind speed multiplier (k)",
                 min_value=0.5, max_value=2.0, value=1.0, step=0.001, format="%.4f",
+                key="adv_mean_multiplier",
                 help=(
                     "Multiplies all wind speeds after diurnal correction. "
                     "k > 1 if model underestimates mean; k < 1 if overestimating. "
@@ -2065,6 +2079,10 @@ if run_btn:
             res_min = int(res_label.split("-")[0])
             with st.spinner(f"Disaggregating to {res_label}…"):
                 df_sub, sub_info = disaggregate_subhourly(df, res_min)
+
+        # Persist sub-hourly series for calibration page to use as output resolution
+        st.session_state["site_df_sub"]    = df_sub   # None when hourly selected
+        st.session_state["site_res_label"] = res_label
 
         # Persist wind results so the AEP section survives re-renders without re-fetching.
         # Use sub-hourly df if disaggregation was requested, so the AEP CSV matches the wind CSV resolution.

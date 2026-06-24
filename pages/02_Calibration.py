@@ -632,6 +632,23 @@ def _build_params_file(
 # CSV builder
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _strip_tz(s: pd.Series) -> tuple[pd.Series, str]:
+    """Return (tz-naive copy, 'UTC+HH:MM' label). Returns (s, '') if already naive."""
+    if s.index.tz is None:
+        return s, ""
+    try:
+        offset = s.index[0].utcoffset()
+        mins = int(offset.total_seconds() // 60)
+        sign = "+" if mins >= 0 else "-"
+        h, m = divmod(abs(mins), 60)
+        tz_label = f"UTC{sign}{h:02d}:{m:02d}"
+    except Exception:
+        tz_label = str(s.index.tz)
+    out = s.copy()
+    out.index = out.index.tz_localize(None)
+    return out, tz_label
+
+
 def _build_csv(
     final_series: pd.Series,
     dir_series: pd.Series | None,
@@ -700,13 +717,18 @@ def _build_csv(
             "Mean multiplier (k) may not be fully representative of long-term conditions."
         )
 
+    # Strip tz from index — record it once in the header instead of every timestamp
+    final_series, _tz_label = _strip_tz(final_series)
+    if _tz_label:
+        lines.insert(3, f"# Timezone: {_tz_label}")
+
     buf = io.StringIO()
     for ln in lines:
         buf.write(ln + "\n")
     col_ws  = f"calibrated_ws_{hub_h}m_ms"
     out_df  = final_series.round(2).to_frame(name=col_ws)
     if dir_series is not None:
-        wd = dir_series.resample("h").mean().reindex(final_series.index)
+        wd = dir_series.resample("h").mean().reindex(final_series.index, method="ffill")
         out_df["wind_direction_deg"] = wd.round(0).astype("Int64")
     out_df.to_csv(buf)
     return buf.getvalue().encode("utf-8")
@@ -722,13 +744,14 @@ def _build_csv_clean(
     imported into WindPRO via the Meteo Object import wizard.
     Timestamps: YYYY-MM-DD HH:MM  Wind speed: m/s (2 dp)  Direction: integer degrees
     """
+    final_series, _tz_label = _strip_tz(final_series)
     col_ws = f"wind_speed_{hub_h}m_ms"
     out_df = final_series.round(2).to_frame(name=col_ws)
     if dir_series is not None:
-        wd = dir_series.resample("h").mean().reindex(final_series.index)
+        wd = dir_series.resample("h").mean().reindex(final_series.index, method="ffill")
         out_df["wind_direction_deg"] = wd.round(0).astype("Int64")
     out_df.index = out_df.index.strftime("%Y-%m-%d %H:%M")
-    out_df.index.name = "datetime"
+    out_df.index.name = f"datetime_{_tz_label}" if _tz_label else "datetime"
     return out_df.to_csv().encode("utf-8")
 
 
@@ -842,6 +865,7 @@ else:
 
 model_full: pd.Series | None = None
 model_dir:  pd.Series | None = None
+model_sub:  pd.Series | None = None   # sub-hourly, loaded from session state when available
 model_label = "Site"
 hub_h: int | str = "?"
 
@@ -875,6 +899,11 @@ if src == "Use data from this session":
             if _wd.index.tz is not None:
                 _wd = _wd.tz_localize(None)
             model_dir = _wd
+        _sdf_sub = st.session_state.get("site_df_sub")
+        if _sdf_sub is not None and "ws_150m_subhourly" in _sdf_sub.columns:
+            model_sub = _sdf_sub["ws_150m_subhourly"].dropna()
+            if model_sub.index.tz is not None:
+                model_sub = model_sub.tz_localize(None)
 
     if model_full is not None:
         st.caption(
@@ -1197,7 +1226,10 @@ with cb:
 
 s_use = s_opt if apply_amp  else 1.0
 k_use = k_opt if apply_mean else 1.0
-final_series = _apply_corrections(model_full, s_use, k_use)
+final_series  = _apply_corrections(model_full, s_use, k_use)  # hourly, for metrics
+# Use sub-hourly series for CSV output if synthesis was run at sub-hourly resolution
+_out_base    = model_sub if model_sub is not None else model_full
+output_series = _apply_corrections(_out_base, s_use, k_use)
 
 p1, p2, p3 = st.columns(3)
 p1.metric("Original model mean",     f"{model_full.mean():.2f} m/s")
@@ -1212,11 +1244,11 @@ slug      = model_label.replace(" ", "_").replace("/", "_")
 now_str   = datetime.now().strftime("%Y%m%d_%H%M")
 
 csv_bytes = _build_csv(
-    final_series, model_dir, model_label, rep, result,
+    output_series, model_dir, model_label, rep, result,
     s_use, k_use, apply_amp, apply_mean,
     float(model_full.mean()), hub_h,
 )
-clean_csv_bytes = _build_csv_clean(final_series, model_dir, hub_h)
+clean_csv_bytes = _build_csv_clean(output_series, model_dir, hub_h)
 params_bytes = _build_params_file(
     model_label, rep, result,
     s_use, k_use, apply_amp, apply_mean,
@@ -1266,10 +1298,13 @@ st.markdown(
 # Persist calibrated parameters in session state for cross-page reference
 st.session_state["calib_amplitude_scale"] = s_use
 st.session_state["calib_mean_multiplier"] = k_use
+st.session_state["calib_s_opt"]           = s_opt   # derived value, for pre-populating main tool
+st.session_state["calib_k_opt"]           = k_opt   # derived value, for pre-populating main tool
 st.session_state["calib_s_applied"]       = apply_amp
 st.session_state["calib_k_applied"]       = apply_mean
 st.session_state["calib_site_label"]      = model_label
 st.session_state["calib_rep_quality"]     = rep["quality"]
+st.session_state["_calib_pending"]        = True  # signal main tool to pre-populate inputs
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Section 6 — Cross-site guidance
