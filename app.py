@@ -667,7 +667,8 @@ def run_pipeline(
     if amplitude_scale != 1.0:
         ws = df["ws_150m_corrected"]
         M  = float(ws.mean())
-        df["ws_150m_corrected"] = (M + amplitude_scale * (ws - M)).clip(lower=0)
+        hour_mean = ws.groupby(ws.index.hour).transform("mean")
+        df["ws_150m_corrected"] = (ws + (amplitude_scale - 1) * (hour_mean - M)).clip(lower=0)
     if mean_multiplier != 1.0:
         df["ws_150m_corrected"] = (df["ws_150m_corrected"] * mean_multiplier).clip(lower=0)
 
@@ -1198,9 +1199,9 @@ The calibration compares the synthetic model output against concurrent site meas
 long-term synthetic record:
 
 1. **Amplitude scale (s):** tunes the day/night diurnal wind speed swing without changing
-   the long-term mean. Found by minimising RMSE between the measured and modelled 24-hour
-   mean diurnal profiles over the concurrent overlap period.
-   > `ws_corr(t) = M + s × (ws(t) − M)`  where M = long-term mean
+   the long-term mean or within-hour variability. Found by minimising RMSE between the
+   measured and modelled 24-hour mean diurnal profiles over the concurrent overlap period.
+   > `ws_corr(t) = ws(t) + (s − 1) × (diurnal_mean[hour(t)] − M)`  where M = long-term mean
 
 2. **Mean multiplier (k):** corrects any remaining mean speed bias after the amplitude
    step. Derived as the ratio of measured to corrected model mean on the overlap period.
@@ -1450,10 +1451,11 @@ with st.sidebar:
                 min_value=0.3, max_value=4.0, value=1.0, step=0.001, format="%.3f",
                 key="adv_amplitude_scale",
                 help=(
-                    "Scales each timestep's deviation from the long-term mean M. "
-                    "Applied post-Weibull: ws_corr = M + s × (ws − M). "
-                    "s < 1 → flatter diurnal profile (raises low hours); s > 1 → more swing. "
-                    "Does not change long-term mean. Enter value from Calibration page parameter file."
+                    "Shifts each hour's mean level by (s−1)×(diurnal_mean[h]−M) while "
+                    "leaving within-hour variability unchanged. "
+                    "s = 1 → no change; s < 1 → flatter diurnal profile (raises low hours); "
+                    "s > 1 → more pronounced swing. Does not change long-term mean. "
+                    "Enter value from Calibration page parameter file."
                 ),
             )
         with _amp_c2:

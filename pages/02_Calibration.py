@@ -392,10 +392,26 @@ def _diurnal_hourly_mean(ws: pd.Series) -> pd.Series:
 
 
 def _apply_amp(ws: pd.Series, s: float) -> pd.Series:
-    """Scale per-timestep deviation from the long-term mean by s.
-    Preserves the long-term mean; changes the diurnal profile shape."""
+    """
+    Additive diurnal correction: shift each timestep by a fixed per-hour offset,
+    leaving within-hour variability completely unchanged.
+
+        ws_corr(t) = ws(t) + (s − 1) × (diurnal_mean[hour(t)] − M)
+
+    where M is the grand long-term mean and diurnal_mean[h] is the mean over all
+    timesteps at hour h.  Equivalent to scaling only the 24-hr mean profile while
+    preserving each timestep's deviation from its own hourly mean.
+
+    s = 1  → identity (no change)
+    s < 1  → flattens the diurnal cycle (raises low hours toward M, lowers high hours)
+    s > 1  → amplifies the diurnal cycle
+    Long-term mean is preserved for any value of s.
+    Maximum per-timestep correction is bounded by |s−1| × diurnal_amplitude,
+    not by the full wind speed variance — prevents spikes and zero-clipping.
+    """
     M = float(ws.mean())
-    return (M + s * (ws - M)).clip(lower=0.0)
+    hour_mean = ws.groupby(ws.index.hour).transform("mean")
+    return (ws + (s - 1) * (hour_mean - M)).clip(lower=0.0)
 
 
 def _rmse_diurnal(s: float, model: pd.Series, meas: pd.Series) -> float:
@@ -601,8 +617,9 @@ def _build_params_file(
         "  AMPLITUDE SCALE (s):",
         f"    Value: {result['amplitude_scale']:.4f}",
         "    Where: Main tool > Advanced settings > Diurnal amplitude scale (s)",
-        "    Effect: Scales each timestep's deviation from the long-term mean M.",
-        "            Formula: ws_corr = M + s × (ws − M)",
+        "    Effect: Shifts each timestep by a fixed per-hour offset, leaving",
+        "            within-hour variability unchanged.",
+        "            Formula: ws_corr(t) = ws(t) + (s−1) × (diurnal_mean[h] − M)",
         "            s < 1 → flatter profile (raises low hours, lowers high hours).",
         "            s > 1 → more pronounced day/night swing.",
         "            Does not change long-term mean.",
@@ -695,11 +712,14 @@ def _build_csv(
         f"# Hourly correlation:  r = {result['r']:.4f},  R² = {result['r2']:.4f}  (overlap period)",
         "#",
         "# --- Method ---",
-        "# Step 1 (amplitude): ws_corr(t) = M + s * (ws(t) - M)",
-        "#   M = long-term mean wind speed of the synthetic record.",
+        "# Step 1 (amplitude): ws_corr(t) = ws(t) + (s-1) * (diurnal_mean[hour(t)] - M)",
+        "#   M = long-term grand mean. diurnal_mean[h] = mean over all timesteps at hour h.",
+        "#   Within-hour variability is preserved exactly; only the 24-hr mean profile shifts.",
         "#   s optimised to minimise RMSE of 24-hr mean diurnal profiles (overlap period).",
         "#   s < 1 flattens the diurnal cycle (raises low hours, lowers high hours).",
-        "#   This step does not change the long-term mean wind speed.",
+        "#   s > 1 amplifies the diurnal cycle. s = 1 = no change.",
+        "#   Long-term mean is preserved for any s. Max per-timestep change bounded by",
+        "#   |s-1| * diurnal_amplitude — no spikes or forced zeros from this step alone.",
         "# Step 2 (mean):      ws_final(t) = ws_corr(t) * k",
         "#   k = mean(measured_overlap) / mean(ws_corr_overlap).",
         "#   This step adjusts the long-term mean to match measurements.",
@@ -793,14 +813,19 @@ may not be seasonally representative — both situations are handled with warnin
 ---
 
 **Factor 1 — Amplitude scale (s):** corrects the day/night diurnal swing without
-changing the long-term mean.
+changing the long-term mean or within-hour variability.
 
-> `ws_corr(t) = M + s × (ws(t) − M)`
+> `ws_corr(t) = ws(t) + (s − 1) × (diurnal_mean[hour(t)] − M)`
 
-where `M` is the long-term mean wind speed of the synthetic record. `s` is found
-by minimising the RMSE between the corrected model and measured 24-hour mean
-diurnal profiles over the overlap period.
-`s < 1` → flatter profile (raises low-wind hours, lowers high-wind hours); `s > 1` → more pronounced swing.
+where `M` is the long-term grand mean and `diurnal_mean[h]` is the mean over all
+timesteps at hour `h`. Each timestep is shifted by a fixed per-hour offset; the
+within-hour stochastic variation is preserved exactly. `s` is found by minimising
+the RMSE between the corrected model and measured 24-hour mean diurnal profiles
+over the overlap period.
+`s < 1` → flatter profile (raises low-wind hours toward M, lowers high-wind hours);
+`s > 1` → more pronounced swing; `s = 1` → no change.
+The maximum correction at any single timestep is `|s − 1| × diurnal_amplitude`,
+keeping the output physically realistic regardless of s.
 This step **does not change the long-term mean**.
 
 **Factor 2 — Mean multiplier (k):** shifts the overall level up or down to match

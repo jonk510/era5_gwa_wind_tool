@@ -190,15 +190,18 @@ def align_hourly(measured: pd.Series, modelled: pd.Series) -> tuple[pd.Series, p
 
 def _scale_modelled(mod_h: pd.Series, meas_h: pd.Series, amplitude_scale: float) -> pd.Series:
     """
-    Apply amplitude_scale to the modelled series.
+    Apply amplitude_scale to the modelled series using an additive per-hour correction.
 
-        ws_scaled(t) = M + scale × (ws(t) − M)
+        ws_corr(t) = ws(t) + (scale − 1) × (diurnal_mean[hour(t)] − M)
 
-    where M is the long-term mean. Preserves the mean; scales deviations from it,
-    which changes the 24-hour mean diurnal profile shape.
+    where M is the grand long-term mean and diurnal_mean[h] is the mean over all
+    timesteps at hour h.  Within-hour variability is preserved exactly.
+    scale = 1 → identity; scale < 1 → flatter diurnal; scale > 1 → more swing.
+    Long-term mean is preserved for any scale.
     """
     M = float(mod_h.mean())
-    return (M + amplitude_scale * (mod_h - M)).clip(lower=0)
+    hour_mean = mod_h.groupby(mod_h.index.hour).transform("mean")
+    return (mod_h + (amplitude_scale - 1) * (hour_mean - M)).clip(lower=0)
 
 
 def rmse_diurnal(amplitude_scale: float, mod_h: pd.Series, meas_h: pd.Series) -> float:
