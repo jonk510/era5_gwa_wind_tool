@@ -666,8 +666,8 @@ def run_pipeline(
     # the values from the parameter file reproduces the calibrated CSV.
     if amplitude_scale != 1.0:
         ws = df["ws_150m_corrected"]
-        dm = ws.groupby(ws.index.hour).transform("mean")
-        df["ws_150m_corrected"] = (dm + amplitude_scale * (ws - dm)).clip(lower=0)
+        M  = float(ws.mean())
+        df["ws_150m_corrected"] = (M + amplitude_scale * (ws - M)).clip(lower=0)
     if mean_multiplier != 1.0:
         df["ws_150m_corrected"] = (df["ws_150m_corrected"] * mean_multiplier).clip(lower=0)
 
@@ -1200,7 +1200,7 @@ long-term synthetic record:
 1. **Amplitude scale (s):** tunes the day/night diurnal wind speed swing without changing
    the long-term mean. Found by minimising RMSE between the measured and modelled 24-hour
    mean diurnal profiles over the concurrent overlap period.
-   > `ws_corr(t) = diurnal_mean(h) + s × (ws(t) − diurnal_mean(h))`
+   > `ws_corr(t) = M + s × (ws(t) − M)`  where M = long-term mean
 
 2. **Mean multiplier (k):** corrects any remaining mean speed bias after the amplitude
    step. Derived as the ratio of measured to corrected model mean on the overlap period.
@@ -1437,10 +1437,10 @@ with st.sidebar:
                 "Diurnal amplitude scale (s)",
                 min_value=0.3, max_value=4.0, value=1.0, step=0.001, format="%.3f",
                 help=(
-                    "Scales each timestep's deviation from its hourly diurnal mean. "
-                    "Applied post-Weibull: ws_corr = dm(h) + s × (ws − dm(h)). "
-                    "s > 1 → larger day/night swing; s < 1 → flatter. Does not change "
-                    "long-term mean. Enter value from Calibration page parameter file."
+                    "Scales each timestep's deviation from the long-term mean M. "
+                    "Applied post-Weibull: ws_corr = M + s × (ws − M). "
+                    "s < 1 → flatter diurnal profile (raises low hours); s > 1 → more swing. "
+                    "Does not change long-term mean. Enter value from Calibration page parameter file."
                 ),
             )
         with _amp_c2:

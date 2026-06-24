@@ -10,6 +10,7 @@ long-term record.
 """
 
 import io
+import re
 from datetime import datetime
 
 import matplotlib
@@ -56,6 +57,169 @@ def _skip_comments(raw: bytes) -> int:
     return n
 
 
+def _is_windpro(raw: bytes) -> bool:
+    """Return True if the bytes look like a WindPRO time-series export."""
+    first = raw.decode("utf-8", errors="replace").split("\n", 1)[0]
+    return "windpro" in first.lower()
+
+
+def _load_windpro_series(raw: bytes) -> tuple[pd.Series | None, str]:
+    """
+    Parse a WindPRO time-series CSV export.
+
+    Header layout (6 lines):
+      1: "WindPRO time series export version 1,,,,,"
+      2: "<height> - <label>,,,,,"
+      3: "<hub height>,,,,,"
+      4: ",Time stamp,MeanWindSpeedUID,..."
+      5: "Disabled,Time stamp (UTC+08:00) Perth,Mean wind speed,..."
+      6: ",d/mm/yyyy h:mm AMPM,m/s,..."
+    Data: <disabled_flag>,<timestamp>,<ws_ms>,<dir_deg>,<TI>,<shear>,
+    """
+    try:
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+
+        # Extract timezone from line 5 (0-indexed line 4)
+        tz_label = ""
+        if len(lines) >= 5:
+            m = re.search(r"UTC[+\-]\d{2}:\d{2}", lines[4])
+            if m:
+                tz_label = m.group(0)   # e.g. "UTC+08:00"
+
+        df = pd.read_csv(io.BytesIO(raw), skiprows=6, header=None)
+        # Cols: 0=disabled flag, 1=timestamp, 2=wind speed, 3=direction, ...
+        df[1] = pd.to_datetime(df[1], format="%d/%m/%Y %H:%M", dayfirst=True)
+        df = df.set_index(1)
+        df.index.name = "datetime"
+
+        ws = pd.to_numeric(df[2], errors="coerce").dropna()
+        ws.name = "wind_speed"
+
+        col_label = f"Mean wind speed [{tz_label}]" if tz_label else "Mean wind speed"
+        return ws, col_label
+    except Exception as e:
+        st.error(f"Failed to parse WindPRO export: {e}")
+        return None, ""
+
+
+def _load_windpro_meteo_series(raw: bytes) -> tuple[pd.Series | None, str]:
+    """
+    Parse a WindPRO Meteo Data Export (.txt, tab-separated).
+
+    Header: free-form metadata lines until a row whose first field is "TimeStamp",
+    followed by a units row, then data rows.
+    Wind speed column detected by "MeanWindSpeed" in the column name.
+    Rows where SampleStatus != 0 are dropped.
+    """
+    try:
+        text  = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+
+        # Extract timezone from metadata block
+        tz_label = ""
+        for line in lines:
+            m = re.search(r"UTC[+\-]\d{2}:\d{2}", line)
+            if m:
+                tz_label = m.group(0)
+                break
+
+        # Find the header row (first field == "TimeStamp")
+        header_idx = None
+        for i, line in enumerate(lines):
+            if line.split("\t")[0].strip() == "TimeStamp":
+                header_idx = i
+                break
+
+        if header_idx is None:
+            st.error("Cannot find data header row in WindPRO Meteo export.")
+            return None, ""
+
+        # Build TSV: header + data (skip the units row at header_idx + 1)
+        data_text = "\n".join([lines[header_idx]] + lines[header_idx + 2:])
+        df = pd.read_csv(io.StringIO(data_text), sep="\t", low_memory=False)
+
+        # Locate wind speed column (contains "MeanWindSpeed")
+        ws_col = next((c for c in df.columns if "MeanWindSpeed" in c), None)
+        if ws_col is None:
+            st.error(f"No MeanWindSpeed column found. Columns: {list(df.columns[:6])}")
+            return None, ""
+
+        # Drop rows flagged as bad by SampleStatus
+        ss_col = next((c for c in df.columns if c.startswith("SampleStatus")), None)
+        if ss_col:
+            bad = pd.to_numeric(df[ss_col], errors="coerce").fillna(0) != 0
+            df  = df[~bad]
+
+        df["TimeStamp"] = pd.to_datetime(df["TimeStamp"], format="%Y-%m-%d %H:%M")
+        df = df.set_index("TimeStamp")
+        df.index.name = "datetime"
+
+        ws = pd.to_numeric(df[ws_col], errors="coerce").dropna()
+        ws.name = "wind_speed"
+
+        # Extract hub height from column name (e.g. "_125.0m_")
+        height_str = ""
+        hm = re.search(r"_(\d+\.?\d*)m_", ws_col)
+        if hm:
+            height_str = f" {hm.group(1)}m"
+
+        col_label = f"Mean wind speed{height_str} [{tz_label}]" if tz_label else f"Mean wind speed{height_str}"
+        return ws, col_label
+    except Exception as e:
+        st.error(f"Failed to parse WindPRO Meteo export: {e}")
+        return None, ""
+
+
+def _load_direction_from_raw(raw: bytes) -> pd.Series | None:
+    """
+    Try to extract a wind direction series from already-read file bytes.
+    Handles all three formats (WindPRO Meteo TXT, WindPRO time-series CSV, standard CSV).
+    Returns None if no direction column can be found.
+    """
+    try:
+        first_line = raw.decode("utf-8", errors="replace").split("\n", 1)[0].lower()
+        if "windpro" in first_line:
+            if "meteo data export" in first_line:
+                # TXT: direction is the DirectionUID column
+                text = raw.decode("utf-8", errors="replace")
+                lines = text.splitlines()
+                hi = next(i for i, l in enumerate(lines) if l.split("\t")[0].strip() == "TimeStamp")
+                data_text = "\n".join([lines[hi]] + lines[hi + 2:])
+                df = pd.read_csv(io.StringIO(data_text), sep="\t", low_memory=False)
+                dir_col = next((c for c in df.columns if "DirectionUID" in c), None)
+                if dir_col is None:
+                    return None
+                ss_col = next((c for c in df.columns if c.startswith("SampleStatus")), None)
+                if ss_col:
+                    df = df[pd.to_numeric(df[ss_col], errors="coerce").fillna(0) == 0]
+                df["TimeStamp"] = pd.to_datetime(df["TimeStamp"], format="%Y-%m-%d %H:%M")
+                wd = pd.to_numeric(df.set_index("TimeStamp")[dir_col], errors="coerce").dropna()
+            else:
+                # CSV: direction is column 3
+                df = pd.read_csv(io.BytesIO(raw), skiprows=6, header=None)
+                df[1] = pd.to_datetime(df[1], format="%d/%m/%Y %H:%M", dayfirst=True)
+                df = df.set_index(1)
+                wd = pd.to_numeric(df[3], errors="coerce").dropna()
+        else:
+            skip = _skip_comments(raw)
+            df = pd.read_csv(io.BytesIO(raw), skiprows=skip, index_col=0, parse_dates=True)
+            dir_col = next(
+                (c for c in df.columns
+                 if "wd_" in c.lower() or "direction" in c.lower() or c.lower().endswith("_deg")),
+                None,
+            )
+            if dir_col is None:
+                return None
+            wd = pd.to_numeric(df[dir_col], errors="coerce").dropna()
+
+        wd.name = "wind_direction"
+        if wd.index.tz is not None:
+            wd = wd.tz_localize(None)
+        return wd
+    except Exception:
+        return None
+
+
 def _load_series(f, ws_col: str | None = None) -> tuple[pd.Series | None, str]:
     """
     Load a wind speed Series from a Streamlit UploadedFile.
@@ -64,7 +228,14 @@ def _load_series(f, ws_col: str | None = None) -> tuple[pd.Series | None, str]:
     Timezone info is stripped — caller is responsible for alignment.
     """
     try:
-        raw  = f.read()
+        raw = f.read()
+        if _is_windpro(raw):
+            first = raw.decode("utf-8", errors="replace").split("\n", 1)[0].lower()
+            if "meteo data export" in first:
+                st.info("WindPRO Meteo Data Export detected — parsing automatically.")
+                return _load_windpro_meteo_series(raw)
+            st.info("WindPRO time-series export detected — parsing automatically.")
+            return _load_windpro_series(raw)
         skip = _skip_comments(raw)
         df   = pd.read_csv(io.BytesIO(raw), skiprows=skip, index_col=0, parse_dates=True)
     except Exception as e:
@@ -217,10 +388,10 @@ def _diurnal_hourly_mean(ws: pd.Series) -> pd.Series:
 
 
 def _apply_amp(ws: pd.Series, s: float) -> pd.Series:
-    """Scale per-timestep deviation from the diurnal hourly mean by s.
-    Preserves the long-term mean (mean of deviations ≈ 0)."""
-    dm = _diurnal_hourly_mean(ws)
-    return (dm + s * (ws - dm)).clip(lower=0.0)
+    """Scale per-timestep deviation from the long-term mean by s.
+    Preserves the long-term mean; changes the diurnal profile shape."""
+    M = float(ws.mean())
+    return (M + s * (ws - M)).clip(lower=0.0)
 
 
 def _rmse_diurnal(s: float, model: pd.Series, meas: pd.Series) -> float:
@@ -426,9 +597,10 @@ def _build_params_file(
         "  AMPLITUDE SCALE (s):",
         f"    Value: {result['amplitude_scale']:.4f}",
         "    Where: Main tool > Advanced settings > Diurnal amplitude scale (s)",
-        "    Effect: Scales each timestep's deviation from its hourly diurnal mean.",
-        "            Formula: ws_corr = dm(h) + s × (ws − dm(h))",
-        "            s > 1 → larger day/night swing; s < 1 → flatter profile.",
+        "    Effect: Scales each timestep's deviation from the long-term mean M.",
+        "            Formula: ws_corr = M + s × (ws − M)",
+        "            s < 1 → flatter profile (raises low hours, lowers high hours).",
+        "            s > 1 → more pronounced day/night swing.",
         "            Does not change long-term mean.",
         "    Cross-site: Moderately transferable to nearby sites with similar",
         "            terrain and stability regime.",
@@ -458,6 +630,7 @@ def _build_params_file(
 
 def _build_csv(
     final_series: pd.Series,
+    dir_series: pd.Series | None,
     site_label: str,
     rep: dict,
     result: dict,
@@ -501,9 +674,10 @@ def _build_csv(
         f"# Hourly correlation:  r = {result['r']:.4f},  R² = {result['r2']:.4f}  (overlap period)",
         "#",
         "# --- Method ---",
-        "# Step 1 (amplitude): ws_corr(t) = diurnal_mean(h) + s * (ws(t) - diurnal_mean(h))",
-        "#   diurnal_mean(h) = long-term mean wind speed at clock hour h.",
+        "# Step 1 (amplitude): ws_corr(t) = M + s * (ws(t) - M)",
+        "#   M = long-term mean wind speed of the synthetic record.",
         "#   s optimised to minimise RMSE of 24-hr mean diurnal profiles (overlap period).",
+        "#   s < 1 flattens the diurnal cycle (raises low hours, lowers high hours).",
         "#   This step does not change the long-term mean wind speed.",
         "# Step 2 (mean):      ws_final(t) = ws_corr(t) * k",
         "#   k = mean(measured_overlap) / mean(ws_corr_overlap).",
@@ -525,9 +699,33 @@ def _build_csv(
     buf = io.StringIO()
     for ln in lines:
         buf.write(ln + "\n")
-    col_name = f"calibrated_ws_{hub_h}m_ms"
-    final_series.round(2).to_frame(name=col_name).to_csv(buf)
+    col_ws  = f"calibrated_ws_{hub_h}m_ms"
+    out_df  = final_series.round(2).to_frame(name=col_ws)
+    if dir_series is not None:
+        wd = dir_series.resample("h").mean().reindex(final_series.index)
+        out_df["wind_direction_deg"] = wd.round(0).astype("Int64")
+    out_df.to_csv(buf)
     return buf.getvalue().encode("utf-8")
+
+
+def _build_csv_clean(
+    final_series: pd.Series,
+    dir_series: pd.Series | None,
+    hub_h,
+) -> bytes:
+    """
+    Plain CSV with no # comment lines — opens directly in Excel and can be
+    imported into WindPRO via the Meteo Object import wizard.
+    Timestamps: YYYY-MM-DD HH:MM  Wind speed: m/s (2 dp)  Direction: integer degrees
+    """
+    col_ws = f"wind_speed_{hub_h}m_ms"
+    out_df = final_series.round(2).to_frame(name=col_ws)
+    if dir_series is not None:
+        wd = dir_series.resample("h").mean().reindex(final_series.index)
+        out_df["wind_direction_deg"] = wd.round(0).astype("Int64")
+    out_df.index = out_df.index.strftime("%Y-%m-%d %H:%M")
+    out_df.index.name = "datetime"
+    return out_df.to_csv().encode("utf-8")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -570,12 +768,12 @@ may not be seasonally representative — both situations are handled with warnin
 **Factor 1 — Amplitude scale (s):** corrects the day/night diurnal swing without
 changing the long-term mean.
 
-> `ws_corr(t) = diurnal_mean(h) + s × (ws(t) − diurnal_mean(h))`
+> `ws_corr(t) = M + s × (ws(t) − M)`
 
-where `diurnal_mean(h)` is the long-term mean wind speed at clock hour h across
-the full synthetic record. `s` is found by minimising the RMSE between the model
-and measured 24-hour mean diurnal profiles over the overlap period.
-`s > 1` → larger day/night swing; `s < 1` → flatter profile.
+where `M` is the long-term mean wind speed of the synthetic record. `s` is found
+by minimising the RMSE between the corrected model and measured 24-hour mean
+diurnal profiles over the overlap period.
+`s < 1` → flatter profile (raises low-wind hours, lowers high-wind hours); `s > 1` → more pronounced swing.
 This step **does not change the long-term mean**.
 
 **Factor 2 — Mean multiplier (k):** shifts the overall level up or down to match
@@ -639,6 +837,7 @@ else:
     )
 
 model_full: pd.Series | None = None
+model_dir:  pd.Series | None = None
 model_label = "Site"
 hub_h: int | str = "?"
 
@@ -654,8 +853,10 @@ if src == "Use data from this session":
                         st.session_state.get("aep_hub_height", "?")))
         except (TypeError, ValueError):
             hub_h = "?"
+        # batch_site_data does not store direction — model_dir stays None
     else:
-        model_full  = st.session_state["site_df"]["ws_150m_corrected"].dropna()
+        _sdf        = st.session_state["site_df"]
+        model_full  = _sdf["ws_150m_corrected"].dropna()
         model_label = st.session_state.get("site_name_input", "Site")
         try:
             hub_h = int(
@@ -665,32 +866,41 @@ if src == "Use data from this session":
             )
         except (TypeError, ValueError):
             hub_h = "?"
+        if "wd_100m" in _sdf.columns:
+            _wd = _sdf["wd_100m"].dropna()
+            if _wd.index.tz is not None:
+                _wd = _wd.tz_localize(None)
+            model_dir = _wd
 
     if model_full is not None:
         st.caption(
             f"**{model_label}** · {len(model_full):,} hourly records · "
             f"{model_full.index[0].date()} → {model_full.index[-1].date()} · "
             f"mean {model_full.mean():.2f} m/s · hub {hub_h} m"
+            + (" · direction included" if model_dir is not None else "")
         )
 else:
     model_upload = st.file_uploader(
         "Upload model output CSV",
         type=["csv"],
         help="Tool-generated CSV (# comment headers OK). "
-             "Wind speed column auto-detected (prefers gwa_corrected_* columns).",
+             "Wind speed and direction columns auto-detected.",
         key="calib_model_file",
     )
     if model_upload:
         ws_hint = st.text_input(
             "Wind speed column (leave blank to auto-detect)", value="", key="calib_model_col"
         )
-        model_full, detected = _load_series(model_upload, ws_hint or None)
+        _raw_model  = model_upload.read()
+        model_full, detected = _load_series(io.BytesIO(_raw_model), ws_hint or None)
+        model_dir   = _load_direction_from_raw(_raw_model)
         if model_full is not None:
             model_label = model_upload.name
             st.caption(
                 f"Column **{detected}** · {len(model_full):,} records · "
                 f"{model_full.index[0].date()} → {model_full.index[-1].date()} · "
                 f"mean {model_full.mean():.2f} m/s"
+                + (f" · direction: {len(model_dir):,} records" if model_dir is not None else " · no direction column found")
             )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -699,11 +909,12 @@ else:
 st.markdown("### 2 — Measured wind speed")
 
 meas_upload = st.file_uploader(
-    "Upload measured wind speed CSV",
-    type=["csv"],
-    help="Any CSV with a datetime index and a wind speed column in m/s. "
-         "'#' comment header lines are skipped automatically. "
-         "Hub-height measurements preferred.",
+    "Upload measured wind speed CSV or WindPRO export",
+    type=["csv", "txt"],
+    help="Accepts: (1) any CSV with datetime index + wind speed column in m/s; "
+         "(2) WindPRO time-series export CSV (auto-detected); "
+         "(3) WindPRO Meteo Data Export .txt (auto-detected). "
+         "'#' comment header lines are skipped automatically.",
     key="calib_meas_file",
 )
 
@@ -985,10 +1196,11 @@ slug      = model_label.replace(" ", "_").replace("/", "_")
 now_str   = datetime.now().strftime("%Y%m%d_%H%M")
 
 csv_bytes = _build_csv(
-    final_series, model_label, rep, result,
+    final_series, model_dir, model_label, rep, result,
     s_use, k_use, apply_amp, apply_mean,
     float(model_full.mean()), hub_h,
 )
+clean_csv_bytes = _build_csv_clean(final_series, model_dir, hub_h)
 params_bytes = _build_params_file(
     model_label, rep, result,
     s_use, k_use, apply_amp, apply_mean,
@@ -996,15 +1208,28 @@ params_bytes = _build_params_file(
     float(model_full.mean()), float(final_series.mean()), hub_h,
 )
 
-dl1, dl2 = st.columns(2)
+dl1, dl2, dl3 = st.columns(3)
 with dl1:
     st.download_button(
-        "⬇ Download calibrated wind speed CSV",
+        "⬇ Download calibrated CSV (full metadata)",
         data=csv_bytes,
         file_name=f"calibrated_{slug}_{now_str}.csv",
         mime="text/csv",
+        help="Includes # comment header with calibration metadata. "
+             "Open in a text editor or Python/pandas (skiprows auto-handled).",
     )
 with dl2:
+    st.download_button(
+        "⬇ Download clean CSV (Excel / WindPRO)",
+        data=clean_csv_bytes,
+        file_name=f"calibrated_clean_{slug}_{now_str}.csv",
+        mime="text/csv",
+        help="No comment lines — opens directly in Excel. "
+             "Import into WindPRO via Meteo Object → Import Wizard, "
+             "mapping 'datetime' → timestamp, 'wind_speed_*m_ms' → mean wind speed, "
+             "'wind_direction_deg' → wind direction.",
+    )
+with dl3:
     st.download_button(
         "⬇ Download calibration parameters (.txt)",
         data=params_bytes,
