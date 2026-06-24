@@ -2663,6 +2663,22 @@ Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** (
             "# Results are indicative only. Do not use as a substitute for on-site measurement.",
             "#",
         ]
+        # Calibration corrections (from Advanced settings)
+        if amplitude_scale != 1.0 or mean_multiplier != 1.0:
+            _header_lines += [
+                "# --- Calibration corrections applied (Advanced settings) ---",
+                f"# Amplitude scale  (s): {amplitude_scale:.4f}"
+                + ("  [applied]" if amplitude_scale != 1.0 else "  [not applied — s=1.0]"),
+                f"# Mean multiplier  (k): {mean_multiplier:.6f}"
+                + ("  [applied]" if mean_multiplier != 1.0 else "  [not applied — k=1.0]"),
+                "# Formula: ws_corr(t) = ws(t) + (s−1)×(diurnal_mean[h]−M);  ws_final(t) = ws_corr(t)×k",
+                "#",
+            ]
+        else:
+            _header_lines += [
+                "# Calibration corrections: none applied (s=1.0, k=1.0)",
+                "#",
+            ]
         _file_header = "\n".join(_header_lines) + "\n"
 
         _hh_int = int(hub_height)

@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy.optimize import minimize_scalar
+from report_gen import generate_calibration_pdf
 
 st.set_page_config(
     page_title="Calibration — ERA5 × GWA",
@@ -758,14 +759,24 @@ def _build_csv_clean(
     final_series: pd.Series,
     dir_series: pd.Series | None,
     hub_h,
+    s_use: float = 1.0,
+    k_use: float = 1.0,
+    apply_amp: bool = False,
+    apply_mean: bool = False,
 ) -> bytes:
     """
     Plain CSV with no # comment lines — opens directly in Excel and can be
     imported into WindPRO via the Meteo Object import wizard.
     Timestamps: YYYY-MM-DD HH:MM  Wind speed: m/s (2 dp)  Direction: integer degrees
+    Calibration status encoded in column name: e.g. wind_speed_150m_ms_s0.971_k1.0234
     """
     final_series, _tz_label = _strip_tz(final_series)
-    col_ws = f"wind_speed_{hub_h}m_ms"
+    # Encode applied calibration in column name so it's self-describing in Excel / WindPRO
+    _calib_parts = []
+    if apply_amp:  _calib_parts.append(f"s{s_use:.3f}")
+    if apply_mean: _calib_parts.append(f"k{k_use:.4f}")
+    _calib_sfx = ("_" + "_".join(_calib_parts)) if _calib_parts else ""
+    col_ws = f"wind_speed_{hub_h}m_ms{_calib_sfx}"
     out_df = final_series.round(2).to_frame(name=col_ws)
     if dir_series is not None:
         wd = dir_series.resample("h").mean().reindex(final_series.index, method="ffill")
@@ -1273,7 +1284,11 @@ csv_bytes = _build_csv(
     s_use, k_use, apply_amp, apply_mean,
     float(model_full.mean()), hub_h,
 )
-clean_csv_bytes = _build_csv_clean(output_series, model_dir, hub_h)
+clean_csv_bytes = _build_csv_clean(
+    output_series, model_dir, hub_h,
+    s_use=s_use, k_use=k_use,
+    apply_amp=apply_amp, apply_mean=apply_mean,
+)
 params_bytes = _build_params_file(
     model_label, rep, result,
     s_use, k_use, apply_amp, apply_mean,
@@ -1288,8 +1303,8 @@ with dl1:
         data=csv_bytes,
         file_name=f"calibrated_{slug}_{now_str}.csv",
         mime="text/csv",
-        help="Includes # comment header with calibration metadata. "
-             "Open in a text editor or Python/pandas (skiprows auto-handled).",
+        help="Includes # comment header with calibration metadata and notation of "
+             "which corrections were applied. Open in a text editor or pandas.",
     )
 with dl2:
     st.download_button(
@@ -1298,9 +1313,8 @@ with dl2:
         file_name=f"calibrated_clean_{slug}_{now_str}.csv",
         mime="text/csv",
         help="No comment lines — opens directly in Excel. "
-             "Import into WindPRO via Meteo Object → Import Wizard, "
-             "mapping 'datetime' → timestamp, 'wind_speed_*m_ms' → mean wind speed, "
-             "'wind_direction_deg' → wind direction.",
+             "Applied calibration encoded in column name (e.g. wind_speed_150m_ms_s0.971_k1.0234). "
+             "Import into WindPRO via Meteo Object → Import Wizard.",
     )
 with dl3:
     st.download_button(
@@ -1311,6 +1325,50 @@ with dl3:
         help="Human-readable record of all calibration factors, quality metrics, "
              "and guidance on where to enter each parameter in the main tool.",
     )
+
+st.markdown("---")
+_pdf_col1, _pdf_col2 = st.columns([1, 2])
+with _pdf_col1:
+    _gen_pdf = st.button(
+        "📄 Generate calibration report (PDF)",
+        use_container_width=True,
+        help="4-page PDF with methodology, correction factors, quality metrics, "
+             "diurnal profile, RMSE curve, monthly comparison, and distribution charts.",
+    )
+with _pdf_col2:
+    if _gen_pdf:
+        with st.spinner("Generating PDF report…"):
+            try:
+                _calib_corrected_full = _apply_corrections(model_full, s_opt, k_opt)
+                _pdf_bytes = generate_calibration_pdf(
+                    model_full=model_full,
+                    model_ov=model_ov,
+                    meas_ov=meas_ov,
+                    corrected_full=_calib_corrected_full,
+                    result=result,
+                    rep=rep,
+                    s_opt=s_opt,
+                    k_opt=k_opt,
+                    s_use=s_use,
+                    k_use=k_use,
+                    apply_amp=apply_amp,
+                    apply_mean=apply_mean,
+                    meas_shift=meas_shift,
+                    model_label=model_label,
+                    hub_h=hub_h,
+                    original_mean=float(model_full.mean()),
+                    corrected_mean=float(final_series.mean()),
+                )
+                st.session_state["calib_pdf"] = _pdf_bytes
+            except Exception as _e:
+                st.error(f"PDF generation failed: {_e}")
+    if "calib_pdf" in st.session_state:
+        st.download_button(
+            "⬇ Download calibration report (PDF)",
+            data=st.session_state["calib_pdf"],
+            file_name=f"calibration_report_{slug}_{now_str}.pdf",
+            mime="application/pdf",
+        )
 
 st.markdown(
     '<div class="good">✓ <b>Fully reproducible:</b> Both corrections are applied post-Weibull '

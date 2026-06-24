@@ -1432,3 +1432,365 @@ def generate_pdf_report(
             _page_wake_matrix(pdf, wake_df, pc[0])
 
     return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Calibration Report
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_calibration_pdf(
+    model_full: "pd.Series",
+    model_ov: "pd.Series",
+    meas_ov: "pd.Series",
+    corrected_full: "pd.Series",
+    result: dict,
+    rep: dict,
+    s_opt: float,
+    k_opt: float,
+    s_use: float,
+    k_use: float,
+    apply_amp: bool,
+    apply_mean: bool,
+    meas_shift: float,
+    model_label: str,
+    hub_h,
+    original_mean: float,
+    corrected_mean: float,
+) -> bytes:
+    """
+    Generate a standalone 4-page PDF calibration report with methodology,
+    correction factors, quality metrics, and analysis charts.
+    """
+    report_dt = datetime.now().strftime("%d %B %Y  %H:%M")
+    MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    pct_improv = (
+        (result["rmse_before"] - result["rmse_after"]) / result["rmse_before"] * 100
+        if result["rmse_before"] > 0 else 0.0
+    )
+    missing_str = (
+        ", ".join(MONTHS[m - 1] for m in rep["missing"])
+        if rep["missing"] else "none"
+    )
+    covered = set(range(1, 13)) - set(rep.get("missing", []))
+
+    def _apply_amp_inline(ws, s):
+        M = float(ws.mean())
+        hm = ws.groupby(ws.index.hour).transform("mean")
+        return (ws + (s - 1) * (hm - M)).clip(lower=0)
+
+    def _rmse_inline(s, mod, meas):
+        corr = _apply_amp_inline(mod, s)
+        pm = corr.groupby(corr.index.hour).mean().reindex(range(24))
+        pr = meas.groupby(meas.index.hour).mean().reindex(range(24))
+        return float(np.sqrt(np.nanmean((pm.values - pr.values) ** 2)))
+
+    def _prof(ser):
+        return ser.groupby(ser.index.hour).mean().reindex(range(24)).values
+
+    def _monthly_mean(ser):
+        mn = ser.resample("ME").mean()
+        return mn.groupby(mn.index.month).mean().reindex(range(1, 13)).values
+
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        d = pdf.infodict()
+        d["Title"]        = f"ERA5 × GWA Calibration Report — {model_label}"
+        d["Author"]       = "ERA5 × GWA Wind Tool"
+        d["CreationDate"] = datetime.now()
+
+        # ── Page 1: Summary ───────────────────────────────────────────────────
+        fig = _fig()
+        _page_chrome(fig, "Measurement Calibration Report", "1")
+        y = _section_band(fig, 0.952, 0.072,
+                          "Measurement Calibration Report",
+                          f"Site: {model_label}  •  {report_dt}")
+        y -= 0.018
+
+        # Info strip
+        PANEL_H = 0.058
+        ax_s = fig.add_axes([ML, y - PANEL_H, AVAIL, PANEL_H])
+        ax_s.set_facecolor("#EFF6FF"); ax_s.axis("off")
+        stats = [
+            ("Site / dataset",   model_label),
+            ("Hub height",       f"{hub_h} m AGL"),
+            ("Overlap start",    rep["start"].strftime("%Y-%m-%d")),
+            ("Overlap end",      rep["end"].strftime("%Y-%m-%d")),
+            ("Overlap duration", f"{rep['n_cal_months']} months  ({rep['n_hours']:,} hourly records)"),
+            ("Timestamp shift",  f"{meas_shift:+.1f} h  applied to measured data"),
+        ]
+        col_w3 = 1.0 / 3
+        for i, (lbl, val) in enumerate(stats):
+            xi = i % 3; yi = i // 3
+            xpos = 0.010 + xi * col_w3
+            ypos = 0.82 - yi * 0.46
+            ax_s.text(xpos, ypos,       lbl, transform=ax_s.transAxes,
+                      fontsize=7.5, color=C_CAPTION, va="top", fontweight="bold")
+            ax_s.text(xpos, ypos - 0.27, val, transform=ax_s.transAxes,
+                      fontsize=8.5, color=C_NAVY, va="top")
+        _rule(fig, y - PANEL_H - 0.001, color=C_BORDER, x0=ML, width=AVAIL)
+        y -= PANEL_H + 0.022
+
+        # Correction factors table
+        y = _h2(fig, y, "Correction Factors")
+        y -= 0.006
+        param_rows = [
+            {
+                "factor":   "Amplitude scale (s)",
+                "derived":  f"{s_opt:.4f}",
+                "applied":  f"{s_use:.4f}",
+                "status":   "Applied" if apply_amp else "Not applied",
+                "effect":   "Reshapes diurnal cycle; long-term mean preserved",
+            },
+            {
+                "factor":   "Mean multiplier (k)",
+                "derived":  f"{k_opt:.6f}",
+                "applied":  f"{k_use:.6f}",
+                "status":   "Applied" if apply_mean else "Not applied",
+                "effect":   "Scales all speeds to match measured mean",
+            },
+        ]
+        param_cols = [
+            ("factor",  "Correction factor",  28),
+            ("derived", "Derived value",      14),
+            ("applied", "Applied value",      14),
+            ("status",  "Status",             14),
+            ("effect",  "Effect",             30),
+        ]
+        y, _ = _render_table(fig, param_rows, param_cols, y, y_min=0.45)
+        y -= 0.022
+
+        # Quality metrics table
+        y = _h2(fig, y, "Quality Metrics  (concurrent overlap period)")
+        y -= 0.006
+        metric_rows = [
+            {"metric": "Hourly Pearson correlation (r)",       "value": f"{result['r']:.4f}"},
+            {"metric": "Variance explained (R²)",              "value": f"{result['r2']:.4f}"},
+            {"metric": "Diurnal RMSE — before correction",     "value": f"{result['rmse_before']:.4f} m/s"},
+            {"metric": "Diurnal RMSE — after correction",      "value": f"{result['rmse_after']:.4f} m/s"},
+            {"metric": "RMSE improvement",                     "value": f"{pct_improv:.1f} %"},
+            {"metric": "Measured mean (overlap)",              "value": f"{result['mean_meas']:.3f} m/s"},
+            {"metric": "Model mean (overlap)",                 "value": f"{rep['ov_mean']:.3f} m/s"},
+            {"metric": "Model mean (long-term full record)",   "value": f"{original_mean:.3f} m/s"},
+            {"metric": "Corrected mean (long-term)",           "value": f"{corrected_mean:.3f} m/s"},
+            {"metric": "Concurrent / long-term ratio",         "value": f"{rep['rep_ratio']:.3f}"},
+            {"metric": "Calendar coverage quality",            "value": rep["quality"].replace("_", " ")},
+            {"metric": "Missing calendar months",              "value": missing_str},
+        ]
+        metric_cols = [
+            ("metric", "Metric", 72),
+            ("value",  "Value",  28),
+        ]
+        _render_table(fig, metric_rows, metric_cols, y, y_min=0.06)
+
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+        # ── Page 2: Methodology ───────────────────────────────────────────────
+        fig = _fig()
+        _page_chrome(fig, "Calibration — Methodology", "2")
+        y = _section_band(fig, 0.952, 0.040, "Calibration Methodology")
+        y -= 0.022
+
+        y = _h1(fig, y, "Overview")
+        y = _para(fig, y,
+            "The calibration process adjusts a synthesised ERA5 × GWA wind speed time series "
+            "to better match concurrent site measurements. Two independent correction factors "
+            "are derived from the overlap period (when model and measured data overlap in time) "
+            "and applied to the full long-term synthetic record.")
+        y -= 0.010
+
+        y = _h2(fig, y, "Step 1 — Amplitude Scale (s): Diurnal Profile Correction")
+        y = _para(fig, y,
+            "ERA5 reanalysis can misrepresent the amplitude of the diurnal wind cycle — "
+            "the day-to-night variation driven by thermal convection and boundary layer "
+            "stability. The amplitude scale s corrects the shape of the 24-hour mean "
+            "diurnal profile without altering the long-term mean or within-hour variability.")
+        y -= 0.005
+        y = _eq(fig, y,
+            "ws_corr(t)  =  ws(t)  +  (s − 1) × (diurnal_mean[hour(t)] − M)",
+            "M = long-term grand mean;  diurnal_mean[h] = mean of all timesteps at hour h")
+        y = _para(fig, y,
+            "Each timestep is shifted by a fixed per-hour offset; within-hour stochastic "
+            "variability is completely preserved. The maximum correction at any single "
+            "timestep is bounded by |s − 1| × diurnal_amplitude (typically 1–3 m/s) — "
+            "not by the full wind speed variance. Long-term mean is preserved exactly.")
+        y = _para(fig, y,
+            "s = 1.0 → no change.   s < 1 → flatter diurnal cycle (raises low-wind hours "
+            "toward M, lowers high-wind hours).   s > 1 → amplifies diurnal cycle.")
+        y = _para(fig, y,
+            f"Optimal s = {s_opt:.4f}  (diurnal RMSE: {result['rmse_before']:.4f} → "
+            f"{result['rmse_after']:.4f} m/s, {pct_improv:.1f}% improvement). "
+            f"s was {'applied' if apply_amp else 'derived but NOT applied — s = 1.0 used in output'}.")
+        y -= 0.012
+
+        y = _h2(fig, y, "Step 2 — Mean Multiplier (k): Mean Speed Correction")
+        y = _para(fig, y,
+            "After the amplitude step, any remaining overall mean speed bias is corrected "
+            "by a scalar multiplier k. This adjusts the long-term level independently of "
+            "the diurnal shape.")
+        y -= 0.005
+        y = _eq(fig, y,
+            "ws_final(t)  =  ws_corr(t)  ×  k",
+            f"k = mean(measured_overlap) / mean(ws_corr_overlap)  =  {k_opt:.6f}")
+        y = _para(fig, y,
+            f"k was {'applied' if apply_mean else 'derived but NOT applied — k = 1.0 used in output'}.")
+        y -= 0.014
+
+        y = _h1(fig, y, "Assumptions and Limitations")
+        bullets = [
+            ("Stationarity", "Correction factors derived from the overlap period are assumed "
+             "to represent the long-term systematic bias. Temporal non-stationarity — instrument "
+             "drift, site changes, land-use change — is not accounted for."),
+            ("Representativeness",
+             f"The concurrent/long-term ratio is {rep['rep_ratio']:.3f} (ideal = 1.0). "
+             f"Coverage quality: {rep['quality'].replace('_', ' ')}. "
+             f"Missing months: {missing_str}. If the overlap period is short or seasonally "
+             f"skewed, the derived k may not reflect true annual conditions."),
+            ("Diurnal pattern", "The amplitude correction targets the long-term 24-hour mean "
+             "profile only. Seasonal or inter-annual shifts in the diurnal pattern are not "
+             "modelled."),
+            ("Reproducibility", "Entering s and k from this report into the main tool's "
+             "Advanced settings and re-running will reproduce the calibrated time series "
+             "exactly — both corrections use identical formulas."),
+        ]
+        for hdr, body in bullets:
+            fig.text(ML + 0.010, y, f"•  {hdr}:", fontsize=9, color=C_NAVY,
+                     va="top", fontweight="bold")
+            y -= 0.0155
+            y = _para(fig, y, body, indent=0.020)
+            y -= 0.005
+
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+        # ── Page 3: Diurnal & RMSE charts ─────────────────────────────────────
+        fig = _fig()
+        _page_chrome(fig, "Calibration — Diurnal Analysis", "3")
+        _section_band(fig, 0.952, 0.040, "Diurnal Profile & Optimisation")
+
+        gs = gridspec.GridSpec(
+            2, 2, figure=fig,
+            left=0.075, right=0.955,
+            top=0.890, bottom=0.075,
+            wspace=0.30, hspace=0.52,
+            height_ratios=[1.5, 1],
+        )
+
+        # Top row: diurnal profile (full width)
+        ax1 = fig.add_subplot(gs[0, :])
+        corrected_ov = _apply_amp_inline(model_ov, s_use)
+        if k_use != 1.0:
+            corrected_ov = (corrected_ov * k_use).clip(lower=0)
+        ax1.plot(range(24), _prof(meas_ov),      "k-",  lw=2.5,
+                 label="Measured (overlap period)", zorder=5)
+        ax1.plot(range(24), _prof(model_ov),     "--",  lw=1.5, color="#94A3B8",
+                 label="Model (uncorrected)")
+        ax1.plot(range(24), _prof(corrected_ov),  "-",  lw=2.2, color="#4F46E5",
+                 label=f"Model corrected  (s={s_use:.3f}, k={k_use:.4f})")
+        ax1.set_xlabel("Hour of day (local time)")
+        ax1.set_ylabel("Mean wind speed (m/s)")
+        ax1.set_title(f"{model_label} — 24-hour mean diurnal profile (concurrent overlap period)",
+                      fontsize=9, fontweight="bold")
+        ax1.set_xticks(range(0, 24, 3))
+        ax1.legend(fontsize=8)
+        _chart_style(ax1)
+
+        # Bottom left: RMSE objective curve
+        ax2 = fig.add_subplot(gs[1, 0])
+        scales_r = np.linspace(0.3, 3.5, 100)
+        rmses_r  = [_rmse_inline(s, model_ov, meas_ov) for s in scales_r]
+        ax2.plot(scales_r, rmses_r, color="#0F172A", lw=1.5)
+        ax2.axvline(s_opt, color="#4F46E5", lw=1.5, ls="--",
+                    label=f"Optimal  s = {s_opt:.3f}")
+        ax2.axvline(1.0,   color="#94A3B8", lw=1.0, ls=":",
+                    label="Default  s = 1.00")
+        ax2.set_xlabel("Amplitude scale (s)")
+        ax2.set_ylabel("Diurnal RMSE (m/s)")
+        ax2.set_title("Objective function: RMSE vs s", fontsize=8.5, fontweight="bold")
+        ax2.legend(fontsize=7.5)
+        _chart_style(ax2)
+
+        # Bottom right: scatter plot (model vs measured, hourly overlap)
+        ax3 = fig.add_subplot(gs[1, 1])
+        ws_m  = model_ov.values
+        ws_ms = meas_ov.values
+        vmax  = max(ws_m.max(), ws_ms.max()) * 1.05
+        ax3.scatter(ws_m, ws_ms, s=2, alpha=0.20, color="#4F46E5", rasterized=True,
+                    label=f"n={len(ws_m):,} hr")
+        ax3.plot([0, vmax], [0, vmax], "k--", lw=0.8, alpha=0.5, label="1:1 line")
+        ax3.set_xlim(0, vmax); ax3.set_ylim(0, vmax)
+        ax3.set_xlabel("Model (m/s)")
+        ax3.set_ylabel("Measured (m/s)")
+        ax3.set_title(
+            f"Hourly scatter  r={result['r']:.3f}  R²={result['r2']:.3f}",
+            fontsize=8.5, fontweight="bold")
+        ax3.legend(fontsize=7.5)
+        _chart_style(ax3)
+
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+        # ── Page 4: Long-term & Distribution charts ────────────────────────────
+        fig = _fig()
+        _page_chrome(fig, "Calibration — Long-term Analysis", "4")
+        _section_band(fig, 0.952, 0.040, "Long-term Wind Speed Analysis")
+
+        gs2 = gridspec.GridSpec(
+            2, 2, figure=fig,
+            left=0.075, right=0.955,
+            top=0.890, bottom=0.075,
+            wspace=0.30, hspace=0.52,
+            height_ratios=[1.2, 1],
+        )
+
+        # Top row: monthly comparison (full width)
+        ax4 = fig.add_subplot(gs2[0, :])
+        x = np.arange(1, 13)
+        ax4.plot(x, _monthly_mean(model_full),     "--", color="#94A3B8", lw=1.5,
+                 label="Model (uncorrected, long-term)")
+        ax4.plot(x, _monthly_mean(corrected_full),  "-", color="#4F46E5", lw=2.2,
+                 label="Model (corrected, long-term)")
+        meas_mn   = meas_ov.resample("ME").mean()
+        meas_by_m = meas_mn.groupby(meas_mn.index.month).mean().reindex(range(1, 13)).values
+        ax4.scatter(x, meas_by_m, color="#16A34A", s=60, zorder=5, marker="D",
+                    label="Measured (overlap months)")
+        ax4.set_xticks(x); ax4.set_xticklabels(MONTHS, rotation=35, ha="right")
+        ax4.set_ylabel("Mean wind speed (m/s)")
+        ax4.set_title(f"{model_label} — Monthly mean wind speed", fontsize=9, fontweight="bold")
+        ax4.legend(fontsize=8)
+        _chart_style(ax4)
+
+        # Bottom left: calendar coverage
+        ax5 = fig.add_subplot(gs2[1, 0])
+        cov_vals   = [1 if m in covered else 0 for m in range(1, 13)]
+        cov_colors = ["#4F46E5" if v else "#E2E8F0" for v in cov_vals]
+        ax5.bar(range(1, 13), cov_vals, color=cov_colors, width=0.7,
+                edgecolor="white", lw=0.5)
+        ax5.set_xticks(range(1, 13))
+        ax5.set_xticklabels(MONTHS, rotation=35, ha="right")
+        ax5.set_yticks([0, 1]); ax5.set_yticklabels(["Missing", "Present"])
+        ax5.set_ylim(0, 1.5)
+        ax5.set_title("Calendar months covered in overlap", fontsize=8.5, fontweight="bold")
+        ax5.spines[["top", "right", "left"]].set_visible(False)
+
+        # Bottom right: wind speed distribution comparison
+        ax6 = fig.add_subplot(gs2[1, 1])
+        ws_mod_v  = model_full.dropna().values
+        ws_cor_v  = corrected_full.dropna().values
+        ws_mea_v  = meas_ov.dropna().values
+        vmax2 = max(ws_mod_v.max(), ws_cor_v.max(), ws_mea_v.max()) * 1.05
+        bins2 = np.linspace(0, vmax2, 38)
+        ax6.hist(ws_mod_v, bins=bins2, density=True, alpha=0.35,
+                 color="#94A3B8", label="Model (uncorr.)")
+        ax6.hist(ws_cor_v, bins=bins2, density=True, alpha=0.45,
+                 color="#4F46E5", label="Corrected")
+        ax6.hist(ws_mea_v, bins=bins2, density=True, alpha=0.55,
+                 color="#16A34A", label="Measured (overlap)")
+        ax6.set_xlabel("Wind speed (m/s)")
+        ax6.set_ylabel("Probability density")
+        ax6.set_title("Wind speed distribution comparison", fontsize=8.5, fontweight="bold")
+        ax6.legend(fontsize=7.5)
+        _chart_style(ax6)
+
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    return buf.getvalue()
