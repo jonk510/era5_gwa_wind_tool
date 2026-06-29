@@ -31,17 +31,16 @@ from scipy.signal import lfilter
 from scipy.special import gamma as sc_gamma
 from scipy.stats import weibull_min
 from streamlit_folium import st_folium
-from timezonefinder import TimezoneFinder
 
 warnings.filterwarnings("ignore")
 
-_TF = TimezoneFinder()
+import os, sys
+from shared.timezone_lookup import get_timezone as _get_tz_shared
 
 
 def detect_timezone(lat: float, lon: float) -> str:
     """Return IANA timezone string for a lat/lon, defaulting to 'UTC'."""
-    tz = _TF.timezone_at(lat=lat, lng=lon)
-    return tz or "UTC"
+    return _get_tz_shared(lat, lon)
 
 
 def localise_df(df: pd.DataFrame, tz_name: str) -> pd.DataFrame:
@@ -829,185 +828,44 @@ MONTH_LABELS = [
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ]
 
+from shared.style import apply_theme, page_header
+apply_theme()
+
 st.markdown("""
 <style>
-/* ── Global ─────────────────────────────────────────────── */
-html, body, [class*="css"] {
-    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
-    -webkit-font-smoothing: antialiased;
-}
-.main .block-container {
-    padding-top: 2rem;
-    padding-bottom: 4rem;
-    max-width: 1400px;
-}
-
-/* ── Sidebar ─────────────────────────────────────────────── */
-[data-testid="stSidebar"] {
-    background: #FAFAFA !important;
-    border-right: 1px solid #EAECF0 !important;
-}
-
-/* ── Primary button ──────────────────────────────────────── */
-.stButton > button[kind="primary"] {
-    background: #0F172A !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 6px !important;
-    font-weight: 500 !important;
-    letter-spacing: 0.01em !important;
-    height: 2.6rem !important;
-    font-size: 0.88rem !important;
-    transition: opacity 0.15s ease !important;
-}
-.stButton > button[kind="primary"]:hover {
-    opacity: 0.85 !important;
-}
-
-/* ── Metric tiles ────────────────────────────────────────── */
-[data-testid="metric-container"] {
-    background: #FFFFFF !important;
-    border: 1px solid #E2E8F0 !important;
-    border-radius: 10px !important;
-    padding: 1rem 1.25rem !important;
-    box-shadow: 0 1px 3px rgba(15,23,42,0.05) !important;
-}
-[data-testid="stMetricLabel"] > div {
-    font-size: 0.72rem !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.07em !important;
-    color: #94A3B8 !important;
-    font-weight: 600 !important;
-}
-[data-testid="stMetricValue"] > div {
-    font-size: 1.55rem !important;
-    font-weight: 700 !important;
-    color: #0F172A !important;
-    letter-spacing: -0.02em !important;
-}
-[data-testid="stMetricDelta"] > div {
-    font-size: 0.78rem !important;
-}
-
-/* ── Expanders ───────────────────────────────────────────── */
-[data-testid="stExpander"] {
-    border: 1px solid #E2E8F0 !important;
-    border-radius: 8px !important;
-    box-shadow: none !important;
-}
-[data-testid="stExpanderToggleIcon"] { color: #94A3B8 !important; }
-
-/* ── Download button ─────────────────────────────────────── */
-.stDownloadButton > button {
-    border-radius: 6px !important;
-    font-weight: 500 !important;
-}
-
-/* ── Section label (small-caps label above a section) ─────── */
-.lbl {
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: #94A3B8;
-    margin: 2.5rem 0 0.4rem 0;
-    display: block;
-}
-/* ── Section heading ─────────────────────────────────────── */
-.sh {
-    font-size: 1.05rem;
-    font-weight: 700;
-    color: #0F172A;
-    margin: 0 0 0.9rem 0;
-    letter-spacing: -0.01em;
-    line-height: 1.25;
-}
-/* ── Thin rule ───────────────────────────────────────────── */
-.hr { border: none; border-top: 1px solid #E2E8F0; margin: 1.5rem 0; }
-
-/* ── Annotation / synthesis note ────────────────────────── */
-.ann {
-    border-left: 2px solid #CBD5E1;
-    padding: 6px 12px;
-    margin: 0.25rem 0 1.5rem 0;
-    font-size: 0.8rem;
-    color: #64748B;
-    line-height: 1.65;
-}
-.ann strong { color: #334155; font-weight: 600; }
-
-/* ── Warning annotation ──────────────────────────────────── */
-.ann-warn {
-    border-left: 2px solid #FCA5A5;
-    padding: 6px 12px;
-    margin: 0.25rem 0 1.5rem 0;
-    font-size: 0.8rem;
-    color: #7F1D1D;
-    line-height: 1.65;
-    background: #FFF5F5;
-    border-radius: 0 4px 4px 0;
-}
-.ann-warn strong { color: #991B1B; font-weight: 600; }
+/* ── ERA5-specific extras (tags) ────────────────────────── */
 
 /* ── Pipeline step rows ──────────────────────────────────── */
 .step {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 11px 14px;
-    background: white;
-    border: 1px solid #E2E8F0;
-    border-radius: 8px;
-    margin-bottom: 6px;
-    transition: border-color 0.15s;
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 11px 14px; background: #0D1A0D;
+    border: 1px solid #1A3A1A; border-radius: 4px; margin-bottom: 6px;
 }
-.step:hover { border-color: #C7D2DC; }
 .step-n {
-    flex-shrink: 0;
-    width: 22px; height: 22px;
-    border-radius: 50%;
-    background: #0F172A;
-    color: white;
-    font-size: 0.68rem;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin-top: 2px;
+    flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
+    background: #39D353; color: #000; font-size: 0.68rem; font-weight: 700;
+    display: flex; align-items: center; justify-content: center; margin-top: 2px;
 }
-.step-title { font-size: 0.86rem; font-weight: 600; color: #0F172A; }
-.step-desc  { font-size: 0.78rem; color: #64748B; line-height: 1.5; margin-top: 3px; }
+.step-title { font-size: 0.86rem; font-weight: 600; color: #86EFAC; }
+.step-desc  { font-size: 0.78rem; color: #6EE7B7; line-height: 1.5; margin-top: 3px; }
+.sh { font-size: 1.05rem; font-weight: 700; color: #39D353; margin: 0 0 0.9rem 0; line-height: 1.25; }
+.hr { border: none; border-top: 1px solid #1A3A1A; margin: 1.5rem 0; }
 .tag {
-    display: inline-block;
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 0.65rem;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    margin-left: 5px;
-    vertical-align: middle;
-    text-transform: uppercase;
+    display: inline-block; padding: 1px 5px; border-radius: 3px;
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.05em;
+    margin-left: 5px; vertical-align: middle; text-transform: uppercase;
 }
-.tag-era5  { background: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; }
-.tag-gwa   { background: #ECFDF5; color: #047857; border: 1px solid #A7F3D0; }
-.tag-synth { background: #F5F3FF; color: #6D28D9; border: 1px solid #DDD6FE; }
+.tag-era5  { background: #0D1A2A; color: #60A5FA; border: 1px solid #1D4ED8; }
+.tag-gwa   { background: #0D1A0D; color: #39D353; border: 1px solid #166534; }
+.tag-synth { background: #1A0D2A; color: #C084FC; border: 1px solid #6D28D9; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Page header ───────────────────────────────────────────────────────────────
-st.markdown(f"""
-<div style="padding-bottom:1.25rem; margin-bottom:0.5rem; border-bottom:1px solid #E2E8F0;">
-  <p style="font-size:0.7rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase;
-            color:#94A3B8; margin:0 0 6px 0;">Wind Resource Tool</p>
-  <h1 style="font-size:1.7rem; font-weight:700; color:#0F172A; margin:0; letter-spacing:-0.03em;
-             line-height:1.15;">Synthetic wind data and Energy time series with wake approximation<br>
-    <span style="font-size:1.1rem; font-weight:600; color:#475569;">(ERA5 × Global Wind Atlas)</span></h1>
-  <p style="font-size:0.9rem; color:#64748B; margin:6px 0 0 0; line-height:1.4;">
-    ERA5 hourly reanalysis &nbsp;·&nbsp; GWA spatial accuracy &nbsp;·&nbsp;
-    <strong style="color:#0F172A;">{st.session_state.get('hub_height', 150):.0f} m</strong> hub height &nbsp;·&nbsp; onshore
-  </p>
-</div>
-""", unsafe_allow_html=True)
+page_header(
+    "ERA5 × Global Wind Atlas — Wind Resource Tool",
+    f"ERA5 hourly reanalysis · GWA spatial accuracy · {st.session_state.get('hub_height', 150):.0f} m hub height · onshore",
+)
 
 with st.expander("About this tool — methodology & pipeline"):
     st.markdown("""

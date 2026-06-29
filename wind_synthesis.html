@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ERA5 × GWA Wind Synthesis</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:#0A0F1A; --sb:#0A1628; --card:#0A1628; --bdr:#1E3A5F;
+  --bl:#3B82F6; --bll:#93C5FD; --blm:#60A5FA;
+  --text:#E2E8F0; --tm:#94A3B8; --font:'Courier New',Courier,monospace;
+}
+body { background:var(--bg); color:var(--text); font-family:var(--font); display:flex; height:100vh; overflow:hidden; font-size:13px; }
+#sb { width:280px; min-width:280px; background:var(--sb); border-right:1px solid var(--bdr); overflow-y:auto; padding:1rem; display:flex; flex-direction:column; }
+#sb h1 { color:var(--bl); font-size:0.82rem; font-weight:700; letter-spacing:0.04em; }
+#sb .sub { color:var(--bll); font-size:0.6rem; margin-bottom:0.8rem; }
+.slbl { font-size:0.58rem; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; color:var(--tm); margin:0.75rem 0 0.25rem; }
+label { font-size:0.67rem; color:var(--tm); display:block; margin:0.4rem 0 0.1rem; }
+input[type=number], select { width:100%; background:#060D18; border:1px solid var(--bdr); color:var(--text); font-family:var(--font); font-size:0.73rem; padding:0.3rem 0.45rem; border-radius:2px; }
+input:focus, select:focus { outline:none; border-color:var(--bl); }
+.r2 { display:grid; grid-template-columns:1fr 1fr; gap:0.4rem; }
+hr { border:none; border-top:1px solid var(--bdr); margin:0.65rem 0; }
+small { font-size:0.57rem; color:var(--tm); display:block; margin-top:0.2rem; }
+.btn { width:100%; padding:0.5rem; background:var(--bl); color:#000; font-family:var(--font); font-size:0.76rem; font-weight:700; border:none; border-radius:2px; cursor:pointer; letter-spacing:0.03em; margin-top:0.4rem; }
+.btn:hover { background:#2563EB; color:#fff; }
+.btn:disabled { background:#1E3A5F; color:#3A5A8A; cursor:not-allowed; }
+.btn-sm { width:100%; padding:0.35rem; background:transparent; color:var(--blm); font-family:var(--font); font-size:0.68rem; border:1px solid var(--bdr); border-radius:2px; cursor:pointer; margin-top:0.3rem; }
+.btn-sm:hover { border-color:var(--bl); color:var(--bl); }
+#main { flex:1; overflow-y:auto; padding:1rem 1.2rem; }
+.hdr { background:var(--sb); border:1px solid var(--bdr); border-radius:3px; padding:0.75rem 1rem; margin-bottom:0.75rem; }
+.hdr h2 { color:var(--bl); font-size:1.05rem; }
+.hdr p  { color:var(--bll); font-size:0.6rem; margin-top:0.1rem; }
+#status { color:var(--blm); font-size:0.72rem; min-height:1.2rem; padding:0.15rem 0; }
+.err { color:#F87171 !important; }
+#placeholder { color:var(--tm); font-size:0.8rem; margin-top:3rem; text-align:center; line-height:2.2; }
+.kgrid { display:grid; grid-template-columns:repeat(6,1fr); gap:0.4rem; margin:0.65rem 0; }
+.kcard { background:var(--card); border:1px solid var(--bdr); border-radius:3px; padding:0.6rem 0.35rem; text-align:center; }
+.kval  { font-size:1.1rem; font-weight:700; color:var(--blm); line-height:1.1; }
+.kunit { font-size:0.57rem; color:var(--tm); margin-top:0.08rem; }
+.klbl  { font-size:0.57rem; color:var(--bll); margin-top:0.12rem; }
+.cgrid { display:grid; grid-template-columns:1fr 1fr; gap:0.7rem; margin:0.65rem 0; }
+.cbox  { background:var(--card); border:1px solid var(--bdr); border-radius:3px; padding:0.4rem; }
+.tw { overflow-x:auto; margin:0.65rem 0; }
+table { width:100%; border-collapse:collapse; font-size:0.66rem; }
+th { background:#060D18; color:var(--bl); padding:0.3rem 0.5rem; text-align:right; border-bottom:1px solid var(--bdr); }
+th:first-child { text-align:left; }
+td { padding:0.28rem 0.5rem; border-bottom:1px solid #0A1628; color:var(--tm); text-align:right; }
+td:first-child { color:var(--text); text-align:left; }
+.dlbtn { display:inline-block; margin:0.5rem 0; padding:0.4rem 0.9rem; background:#1E3A5F; color:var(--text); border:1px solid var(--bl); font-family:var(--font); font-size:0.7rem; font-weight:700; border-radius:2px; cursor:pointer; }
+.dlbtn:hover { background:#254e94; }
+.sect { color:var(--bl); font-size:0.7rem; font-weight:700; margin:0.5rem 0 0.25rem; }
+.warn-box { background:#1A1000; border:1px solid #854D0E; border-radius:3px; padding:0.5rem 0.7rem; font-size:0.66rem; color:#FDE68A; margin:0.4rem 0; }
+.info-box { background:#0A1628; border:1px solid var(--bdr); border-radius:3px; padding:0.4rem 0.6rem; font-size:0.62rem; color:var(--tm); margin:0.3rem 0; }
+</style>
+</head>
+<body>
+
+<!-- ── Sidebar ── -->
+<div id="sb">
+  <h1>&gt; ERA5 × GWA WIND SYNTHESIS_</h1>
+  <p class="sub">Open-Meteo ERA5 · Global Wind Atlas · pvlib pipeline</p>
+  <hr>
+
+  <div class="slbl">Location (WGS84)</div>
+  <label>Latitude</label>
+  <input type="number" id="lat" value="-31.9505" step="0.0001" min="-90" max="90">
+  <label>Longitude</label>
+  <input type="number" id="lon" value="115.8605" step="0.0001" min="-180" max="180">
+
+  <div class="slbl">ERA5 Period</div>
+  <div class="r2">
+    <div><label>Start Year</label><input type="number" id="sy" value="2015" min="1990" max="2024"></div>
+    <div><label>End Year</label><input type="number" id="ey" value="2023" min="1990" max="2024"></div>
+  </div>
+
+  <div class="slbl">Hub Height</div>
+  <label>Hub Height (m)</label>
+  <input type="number" id="hh" value="150" min="10" max="300" step="5">
+
+  <div class="slbl">GWA Data</div>
+  <button class="btn-sm" onclick="fetchGWA()">[ AUTO-FETCH FROM GWA ]</button>
+  <div id="gwaStatus" class="info-box" style="display:none"></div>
+  <div id="gwaManual" style="display:none">
+    <small style="color:#FDE68A;margin-top:0.4rem">GWA auto-fetch blocked — enter manually:</small>
+    <div class="r2" style="margin-top:0.3rem">
+      <div><label>A at hub (m/s)</label><input type="number" id="gwaA" value="7.5" step="0.1" min="0.5"></div>
+      <div><label>k at hub</label><input type="number" id="gwaK" value="2.0" step="0.05" min="0.5"></div>
+    </div>
+    <div class="r2">
+      <div><label>A at 100m (m/s)</label><input type="number" id="gwaA100" value="6.8" step="0.1" min="0.5"></div>
+      <div><label>k at 100m</label><input type="number" id="gwaK100" value="2.0" step="0.05" min="0.5"></div>
+    </div>
+    <small>Find these on globalwindatlas.info → click site → Wind climate</small>
+  </div>
+  <div id="gwaOk" class="info-box" style="display:none"></div>
+
+  <div class="slbl">AEP (optional)</div>
+  <label>Turbine type</label>
+  <select id="turbine">
+    <option value="none">— skip AEP —</option>
+    <option value="2mw">Generic 2 MW IEC Class I</option>
+    <option value="3mw">Generic 3 MW IEC Class I</option>
+    <option value="4mw">Generic 4 MW IEC Class I</option>
+    <option value="5mw">Generic 5 MW IEC Class S</option>
+  </select>
+  <label>Nameplate capacity (MW)</label>
+  <input type="number" id="nameplate" value="50" min="0.1" step="1">
+  <label>Availability loss (%)</label>
+  <input type="number" id="avail" value="2" min="0" max="50" step="0.5">
+
+  <hr>
+  <button id="runBtn" class="btn" onclick="run()" disabled>[ RUN ANALYSIS ]</button>
+  <small style="margin-top:0.3rem">Auto-fetch GWA first, or enter values manually above</small>
+</div>
+
+<!-- ── Main ── -->
+<div id="main">
+  <div class="hdr">
+    <h2>&gt; ERA5 × GWA Wind Resource Synthesis_</h2>
+    <p>ERA5 reanalysis (Open-Meteo) · Global Wind Atlas Weibull calibration · IEC V_eq air density correction · onshore sites</p>
+  </div>
+  <div id="status"></div>
+  <div id="placeholder">
+    <p style="color:var(--bl);font-size:1rem">awaiting input_</p>
+    <p>1. Enter coordinates &nbsp;·&nbsp; 2. Click [ AUTO-FETCH FROM GWA ] &nbsp;·&nbsp; 3. Click [ RUN ANALYSIS ]</p>
+    <p style="font-size:0.62rem;margin-top:0.4rem">ERA5 via Open-Meteo API · GWA via globalwindatlas.info · No backend required</p>
+  </div>
+  <div id="results" style="display:none">
+    <div class="kgrid" id="kgrid"></div>
+    <div class="cgrid">
+      <div class="cbox"><div id="cDist"    style="height:275px"></div></div>
+      <div class="cbox"><div id="cMonthly" style="height:275px"></div></div>
+    </div>
+    <div class="cgrid">
+      <div class="cbox"><div id="cDiurnal" style="height:275px"></div></div>
+      <div class="cbox"><div id="cShear"   style="height:275px"></div></div>
+    </div>
+    <div class="cbox" style="margin:0.65rem 0"><div id="cDaily" style="height:220px"></div></div>
+    <div id="aepSection" style="display:none">
+      <div class="sect">AEP Results</div>
+      <div class="kgrid" id="aepGrid" style="grid-template-columns:repeat(4,1fr)"></div>
+      <div class="cbox" style="margin:0.65rem 0"><div id="cAEP" style="height:240px"></div></div>
+    </div>
+    <div class="sect">Annual Wind Summary</div>
+    <div class="tw"><table id="tbl"></table></div>
+    <button class="dlbtn" onclick="dlCSV()">[ DOWNLOAD WIND TIME SERIES CSV ]</button>
+    <div style="font-size:0.58rem;color:var(--tm);margin-bottom:1rem">
+      Columns: datetime_utc · ws_100m_ms · ws_hub_raw_ms · ws_hub_corrected_ms · alpha_h · air_density_kgm3 · wd_100m_deg
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Palette ───────────────────────────────────────────────────────────────────
+const BL='#3B82F6', BLL='#93C5FD', BLM='#60A5FA', TM='#94A3B8';
+const BG='rgba(0,0,0,0)', GRID='rgba(59,130,246,0.09)';
+const FONT={color:TM,family:"'Courier New',monospace",size:10};
+const BL2={paper_bgcolor:BG,plot_bgcolor:BG,font:FONT,margin:{t:34,b:46,l:52,r:12}};
+const AX={gridcolor:GRID,color:TM,zerolinecolor:GRID};
+const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+// ── Math ──────────────────────────────────────────────────────────────────────
+function gamma(z) {  // Lanczos approximation
+  const p=[0.99999999999980993,676.5203681218851,-1259.1392167224028,
+           771.32342877765313,-176.61502916214059,12.507343278686905,
+           -0.13857109526572012,9.9843695780195716e-6,1.5056327351493116e-7];
+  if(z<0.5) return Math.PI/(Math.sin(Math.PI*z)*gamma(1-z));
+  z-=1; let x=p[0];
+  for(let i=1;i<9;i++) x+=p[i]/(z+i);
+  const t=z+7.5;
+  return Math.sqrt(2*Math.PI)*Math.pow(t,z+0.5)*Math.exp(-t)*x;
+}
+
+function bisect(f,a,b,tol=1e-8,maxIter=100){
+  for(let i=0;i<maxIter;i++){
+    const c=(a+b)/2, fc=f(c);
+    if(Math.abs(fc)<tol||(b-a)<tol) return c;
+    Math.sign(fc)===Math.sign(f(a)) ? a=c : b=c;
+  }
+  return (a+b)/2;
+}
+
+function weibullMLE(data){
+  // 2-parameter Weibull MLE (floc=0), Newton-Raphson
+  const n=data.length;
+  if(n<5) return {k:2,A:data.reduce((a,b)=>a+b,0)/n/gamma(1.5)};
+  const logX=data.map(x=>Math.log(Math.max(x,0.001)));
+  const sumLogX=logX.reduce((a,b)=>a+b,0);
+  // initial guess via method of moments (CV)
+  const mu=data.reduce((a,b)=>a+b,0)/n;
+  const mu2=data.reduce((a,b)=>a+b*b,0)/n;
+  const cv2=mu2/(mu*mu)-1;
+  let k=cv2>0?Math.pow(cv2,-1.086):2;
+  for(let iter=0;iter<100;iter++){
+    const xk=data.map(x=>Math.pow(x,k));
+    const xkl=data.map((x,i)=>xk[i]*logX[i]);
+    const xkl2=data.map((x,i)=>xk[i]*logX[i]*logX[i]);
+    const sxk=xk.reduce((a,b)=>a+b,0);
+    const sxkl=xkl.reduce((a,b)=>a+b,0);
+    const sxkl2=xkl2.reduce((a,b)=>a+b,0);
+    const f=n/k+sumLogX-n*sxkl/sxk;
+    const df=-n/(k*k)-n*(sxkl2*sxk-sxkl*sxkl)/(sxk*sxk);
+    const dk=-f/df;
+    k=Math.max(0.2,k+dk);
+    if(Math.abs(dk/k)<1e-9) break;
+  }
+  const xk=data.map(x=>Math.pow(x,k));
+  const A=Math.pow(xk.reduce((a,b)=>a+b,0)/n,1/k);
+  return {k,A};
+}
+
+function weibullPDF(v,A,k){ return (k/A)*Math.pow(v/A,k-1)*Math.exp(-Math.pow(v/A,k)); }
+
+// Quantile transform: ERA5 → GWA distribution (rank-preserving)
+function quantileTransform(v,kE,AE,kG,AG){
+  return Math.max(0, AG*Math.pow(Math.max(v,0.01)/AE,kE/kG));
+}
+
+// ── GWC parsing ───────────────────────────────────────────────────────────────
+let GWC = null;  // { heights: [...], data: { height: {A,k,mean} } }
+
+function parseGWC(text, refR=0.1){
+  text=text.replace(/<[^>]+>/g,'').replace(/\r/g,'').trim();
+  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l&&!/^#/.test(l));
+  const hdr=lines[0].split(/\s+/).map(Number);
+  const nR=hdr[0], nH=hdr[1]; // n_roughness, n_heights
+  const roughnesses=lines[1].split(/\s+/).map(Number);
+  const allData={};
+  let li=2;
+  for(let ri=0;ri<nR;ri++){
+    const r=roughnesses[ri];
+    allData[r]={};
+    for(let hi=0;hi<nH;hi++){
+      const hLine=lines[li++].split(/\s+/).map(Number);
+      const height=hLine[0];
+      const fArr=lines[li++].split(/\s+/).map(Number);
+      const aArr=lines[li++].split(/\s+/).map(Number);
+      const kArr=lines[li++].split(/\s+/).map(Number);
+      // Combined omnidirectional Weibull via method of moments
+      const fSum=fArr.reduce((a,b)=>a+b,0);
+      const fn=fArr.map(x=>x/fSum);
+      const mu=fn.reduce((s,fi,i)=>s+fi*aArr[i]*gamma(1+1/kArr[i]),0);
+      const mu2=fn.reduce((s,fi,i)=>s+fi*aArr[i]*aArr[i]*gamma(1+2/kArr[i]),0);
+      const vr=mu2-mu*mu;
+      let kc=2.0;
+      if(vr>0&&mu>0){
+        const rat=mu*mu/(vr+mu*mu);
+        try{ kc=bisect(k=>{const g1=gamma(1+1/k);return gamma(1+2/k)/(g1*g1)-rat;},0.5,10); }
+        catch(e){}
+      }
+      const Ac=mu/gamma(1+1/kc);
+      allData[r][height]={A:Ac,k:kc,mean:mu};
+    }
+  }
+  // Select roughness class closest to ref
+  const land=roughnesses.filter(r=>r>0.001);
+  const selR=land.reduce((b,r)=>Math.abs(r-refR)<Math.abs(b-refR)?r:b,land[0]||roughnesses[0]);
+  const heights=Object.keys(allData[selR]).map(Number).sort((a,b)=>a-b);
+  return {heights,data:allData[selR],roughness:selR};
+}
+
+function gwaAtHeight(gwc,h){
+  const hs=gwc.heights;
+  if(gwc.data[h]) return gwc.data[h];
+  if(h<=hs[0]) return gwc.data[hs[0]];
+  if(h>=hs[hs.length-1]) return gwc.data[hs[hs.length-1]];
+  const lo=Math.max(...hs.filter(x=>x<h));
+  const hi=Math.min(...hs.filter(x=>x>h));
+  const t=Math.log(h/lo)/Math.log(hi/lo);
+  const dlo=gwc.data[lo],dhi=gwc.data[hi];
+  return {
+    A:dlo.A*Math.pow(dhi.A/dlo.A,t),
+    k:dlo.k+t*(dhi.k-dlo.k),
+    mean:dlo.mean*Math.pow(dhi.mean/dlo.mean,t),
+  };
+}
+
+// ── API fetching ──────────────────────────────────────────────────────────────
+async function fetchGWA(){
+  const lat=+v('lat'),lon=+v('lon');
+  setGWAStatus('Fetching GWA data…','info');
+  document.getElementById('gwaManual').style.display='none';
+  document.getElementById('gwaOk').style.display='none';
+  try {
+    const url=`https://globalwindatlas.info/api/gwa/custom/Lib/?lat=${lat}&long=${lon}`;
+    const r=await fetch(url,{headers:{Referer:'https://globalwindatlas.info','User-Agent':'Mozilla/5.0'}});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    const text=await r.text();
+    GWC=parseGWC(text,0.1);
+    const hs=GWC.heights;
+    const hh=+v('hh');
+    const hub=gwaAtHeight(GWC,hh);
+    const h100=gwaAtHeight(GWC,100);
+    const el=document.getElementById('gwaOk');
+    el.style.display='';
+    el.textContent=`GWA OK · ${hs.length} heights (${hs[0]}–${hs[hs.length-1]}m) · roughness r=${GWC.roughness}m · Hub: A=${hub.A.toFixed(2)}m/s k=${hub.k.toFixed(2)} · 100m: A=${h100.A.toFixed(2)}m/s`;
+    setGWAStatus('','info');
+    document.getElementById('runBtn').disabled=false;
+  } catch(e) {
+    GWC=null;
+    setGWAStatus('Auto-fetch failed ('+e.message+'). Enter GWA values manually below.','warn');
+    document.getElementById('gwaManual').style.display='';
+    document.getElementById('runBtn').disabled=false;
+  }
+}
+
+function setGWAStatus(msg,type){
+  const el=document.getElementById('gwaStatus');
+  if(!msg){el.style.display='none';return;}
+  el.style.display='';
+  el.className=type==='warn'?'warn-box':'info-box';
+  el.textContent=msg;
+}
+
+async function fetchERA5Year(lat,lon,yr){
+  const params='wind_speed_100m,wind_speed_10m,wind_gusts_10m,wind_direction_100m,temperature_2m';
+  const url=`https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}`
+          +`&start_date=${yr}-01-01&end_date=${yr}-12-31`
+          +`&hourly=${params}&wind_speed_unit=ms&timezone=UTC`;
+  const r=await fetch(url);
+  if(!r.ok) throw new Error(`Open-Meteo ${yr}: HTTP ${r.status}`);
+  const j=await r.json();
+  const h=j.hourly;
+  return h.time.map((t,i)=>({
+    time:t,
+    ws100:h.wind_speed_100m[i]??0,
+    ws10: h.wind_speed_10m[i]??0,
+    gust: h.wind_gusts_10m[i]??0,
+    wd:   h.wind_direction_100m[i]??0,
+    t2m:  h.temperature_2m[i]??15,
+    hour: +t.slice(11,13),
+    month:+t.slice(5,7),
+    year: +t.slice(0,4),
+  })).filter(r=>r.ws100!=null&&r.ws100>=0);
+}
+
+// ── Pipeline ──────────────────────────────────────────────────────────────────
+let ROWS=[], META={};
+
+async function run(){
+  const btn=document.getElementById('runBtn');
+  btn.disabled=true;
+  hide('results'); hide('placeholder'); setS('');
+  try{
+    const lat=+v('lat'),lon=+v('lon');
+    const sy=+v('sy'), ey=+v('ey');
+    const hh=+v('hh');
+    const ny=ey-sy+1;
+    const utcOff=Math.round(lon/15);
+
+    // Get GWA data
+    let gwaHub, gwa100, alphaRaw;
+    if(GWC){
+      gwaHub=gwaAtHeight(GWC,hh);
+      gwa100=gwaAtHeight(GWC,100);
+    } else {
+      gwaHub={A:+v('gwaA'),  k:+v('gwaK'),  mean:+v('gwaA')*gamma(1+1/+v('gwaK'))};
+      gwa100={A:+v('gwaA100'),k:+v('gwaK100'),mean:+v('gwaA100')*gamma(1+1/+v('gwaK100'))};
+    }
+
+    // Fetch ERA5
+    let raw=[];
+    for(let yr=sy;yr<=ey;yr++){
+      setS(`Fetching ERA5 ${yr}… (${yr-sy+1}/${ny})`);
+      raw=raw.concat(await fetchERA5Year(lat,lon,yr));
+    }
+    setS(`Processing ${raw.length.toLocaleString()} records…`);
+
+    // Step 1: mean shear alpha from GWA
+    const logHRatio=Math.log(hh/100);
+    if(Math.abs(logHRatio)<1e-6){
+      alphaRaw=0.2;
+    } else {
+      alphaRaw=Math.log(gwaHub.mean/gwa100.mean)/logHRatio;
+    }
+    const alphaMean=Math.max(0.05,Math.min(0.60,alphaRaw));
+
+    // Step 2: diurnal shear from ERA5 10/100m (grouped by local hour)
+    const byHour=Array.from({length:24},()=>[]);
+    raw.forEach(r=>{
+      if(r.ws10>0.5&&r.ws100>0.5){
+        const alpha=Math.log(r.ws100/r.ws10)/Math.log(100/10);
+        const lh=((r.hour+utcOff)%24+24)%24;
+        byHour[lh].push(Math.max(0.03,Math.min(0.8,alpha)));
+      }
+    });
+    const diurnalERA5=byHour.map(a=>a.length?a.reduce((s,x)=>s+x,0)/a.length:alphaMean);
+    const dMean=diurnalERA5.reduce((a,b)=>a+b,0)/24;
+    const diurnalAlpha=diurnalERA5.map(a=>dMean>0?a/dMean*alphaMean:alphaMean);
+
+    // Step 3: height extrapolation
+    raw.forEach(r=>{
+      const lh=((r.hour+utcOff)%24+24)%24;
+      r.alpha=diurnalAlpha[lh];
+      r.wsRaw=r.ws100*Math.pow(hh/100,r.alpha);
+      r.lhour=lh;
+    });
+
+    // Step 4: Weibull MLE on ERA5 hub data
+    const wsClean=raw.map(r=>r.wsRaw).filter(x=>x>0.1);
+    const {k:kE,A:AE}=weibullMLE(wsClean);
+
+    // Step 5: Quantile transform to GWA
+    const kG=gwaHub.k, AG=gwaHub.A;
+    if(AE<0.01){
+      raw.forEach(r=>r.wsCor=Math.max(0,r.wsRaw));
+    } else {
+      raw.forEach(r=>r.wsCor=quantileTransform(r.wsRaw,kE,AE,kG,AG));
+    }
+
+    // Step 6: Air density at hub height
+    const hAsl=hh; // elevation not fetched — use hub height as ASL approx
+    const Phub=101325*Math.pow(1-2.2558e-5*hAsl,5.2559);
+    raw.forEach(r=>{
+      const Thub=(r.t2m+273.15)-0.0065*Math.max(0,hh-2);
+      r.rho=Math.max(0.9,Math.min(1.4,Phub/(287.05*Thub)));
+      // IEC V_eq
+      r.wsEq=r.wsCor*Math.pow(r.rho/1.225,1/3);
+    });
+
+    ROWS=raw;
+    const meanCor=raw.reduce((s,r)=>s+r.wsCor,0)/raw.length;
+    const meanRho=raw.reduce((s,r)=>s+r.rho,0)/raw.length;
+    META={lat,lon,sy,ey,hh,ny,alphaMean,gwaHub,gwa100,kE,AE,kG,AG,meanCor,meanRho,utcOff};
+
+    // AEP
+    const turb=v('turbine');
+    let aepMeta=null;
+    if(turb!=='none'){
+      setS('Computing AEP…');
+      aepMeta=calcAEP(raw,turb,+v('nameplate'),+v('avail'));
+    }
+
+    render(raw,META,aepMeta);
+    setS('');
+    show('results');
+  }catch(e){
+    setS('Error: '+e.message,true);
+    show('placeholder');
+  }finally{ btn.disabled=false; }
+}
+
+// ── Turbine power curves ───────────────────────────────────────────────────────
+const CURVES={
+  '2mw':{ rated:2000, ws:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,25,26],
+           kw:[0,0,0,0,70,178,343,580,876,1210,1541,1793,1930,1990,2000,2000,0] },
+  '3mw':{ rated:3000, ws:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,25,26],
+           kw:[0,0,0,0,95,240,462,790,1195,1670,2170,2640,2900,2990,3000,3000,0] },
+  '4mw':{ rated:4000, ws:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,25,26],
+           kw:[0,0,0,0,120,310,608,1038,1580,2220,2900,3520,3870,3990,4000,4000,0] },
+  '5mw':{ rated:5000, ws:[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,25,26],
+           kw:[0,0,0,0,150,380,740,1270,1940,2720,3580,4390,4840,4980,5000,5000,5000,0] },
+};
+
+function pcInterp(curve,ws){
+  const {ws:wsArr,kw:kwArr}=curve;
+  if(ws<=wsArr[0]||ws>=wsArr[wsArr.length-1]) return 0;
+  for(let i=1;i<wsArr.length;i++){
+    if(ws<=wsArr[i]){
+      const t=(ws-wsArr[i-1])/(wsArr[i]-wsArr[i-1]);
+      return kwArr[i-1]+t*(kwArr[i]-kwArr[i-1]);
+    }
+  }
+  return 0;
+}
+
+function calcAEP(rows,turbKey,nameplateMW,availPct){
+  const curve=CURVES[turbKey];
+  const ratedMW=curve.rated/1000;
+  const scale=nameplateMW/ratedMW;
+  const avail=1-availPct/100;
+  const n_years=(rows[rows.length-1].year-rows[0].year+1);
+
+  let grossKWh=0, grossByMonth=Array(12).fill(0), monthCount=Array(12).fill(0);
+  rows.forEach(r=>{
+    const p=pcInterp(curve,r.wsEq)*scale;  // kW
+    r.gross_kw=p;
+    grossKWh+=p;
+    grossByMonth[r.month-1]+=p;
+    monthCount[r.month-1]++;
+  });
+
+  const grossAEP=grossKWh/1000/n_years;  // MWh/yr
+  const netAEP=grossAEP*avail;
+  const cf=netAEP/(nameplateMW*8760)*100;
+
+  // Average monthly gross (MWh/month)
+  const monthly=grossByMonth.map((s,i)=>{
+    const yrs=[...new Set(rows.filter(r=>r.month===i+1).map(r=>r.year))].length;
+    return yrs>0?s/1000/yrs:0;
+  });
+
+  return {grossAEP,netAEP,cf,nameplateMW,ratedMW,turbKey,monthly};
+}
+
+// ── Render ─────────────────────────────────────────────────────────────────────
+const v=id=>document.getElementById(id).value;
+const show=id=>document.getElementById(id).style.display='';
+const hide=id=>document.getElementById(id).style.display='none';
+const f2=n=>n.toFixed(2);
+const f1=n=>n.toFixed(1);
+const setS=(m,err=false)=>{
+  const el=document.getElementById('status');
+  el.textContent=m?'> '+m:'';el.className=err?'err':'';
+};
+
+function K(val,unit,lbl){ return `<div class="kcard"><div class="kval">${val}</div><div class="kunit">${unit}</div><div class="klbl">${lbl}</div></div>`; }
+
+function tL(title,yT,extra={}){
+  return {...BL2,
+    title:{text:title,font:{color:BLL,size:11,family:"'Courier New',monospace"}},
+    xaxis:{...AX,...(extra.xaxis||{})},
+    yaxis:{...AX,title:yT,...(extra.yaxis||{})},
+    showlegend:extra.showlegend||false,
+    legend:extra.legend||{},
+    ...Object.fromEntries(Object.entries(extra).filter(([k])=>!['xaxis','yaxis','showlegend','legend'].includes(k))),
+  };
+}
+const PC={responsive:true,displayModeBar:false};
+
+function render(rows,m,aep){
+  // KPIs
+  const era100=rows.reduce((s,r)=>s+r.ws100,0)/rows.length;
+  document.getElementById('kgrid').innerHTML=
+    K(f2(era100),'m/s','ERA5 mean @ 100m')+
+    K(f2(m.meanCor),'m/s',`GWA-corrected @ ${m.hh}m`)+
+    K(f2(m.gwaHub.A),'m/s',`GWA Weibull A (${m.hh}m)`)+
+    K(f2(m.gwaHub.k),'','GWA Weibull k')+
+    K(f2(m.alphaMean),'','Wind shear α (GWA)')+
+    K(f2(m.meanRho),'kg/m³','Mean air density');
+
+  chartDist(rows,m);
+  chartMonthly(rows,m);
+  chartDiurnal(rows,m);
+  chartShear(rows,m);
+  chartDaily(rows,m);
+  if(aep){
+    renderAEP(aep);
+    show('aepSection');
+  } else {
+    hide('aepSection');
+  }
+  renderTable(rows,m);
+}
+
+function chartDist(rows,m){
+  const ws=rows.map(r=>r.wsCor).filter(x=>x>0);
+  const wsR=rows.map(r=>r.wsRaw).filter(x=>x>0);
+  const bins=Array.from({length:61},(_,i)=>i*0.5);
+  const bc=bins.slice(0,-1).map((b,i)=>(b+bins[i+1])/2);
+  const hist=(data)=>{
+    const h=new Array(60).fill(0);
+    data.forEach(x=>{const i=Math.min(59,Math.floor(x/0.5));h[i]++;});
+    const tot=data.length*0.5;
+    return h.map(c=>c/tot);
+  };
+  const hR=hist(wsR), hC=hist(ws);
+  const pdf=bc.map(v=>weibullPDF(v,m.AG,m.kG));
+
+  Plotly.newPlot('cDist',[
+    {type:'bar',name:`ERA5 raw ${m.hh}m`,x:bc,y:hR,marker:{color:'rgba(148,163,184,0.4)'},width:0.5,showlegend:true},
+    {type:'bar',name:`GWA-corrected ${m.hh}m`,x:bc,y:hC,marker:{color:'rgba(59,130,246,0.55)'},width:0.5,showlegend:true},
+    {type:'scatter',name:'GWA Weibull target',x:bc,y:pdf,mode:'lines',line:{color:'#E2E8F0',width:2,dash:'dash'},showlegend:true},
+  ],tL(`Wind Speed Distribution @ ${m.hh}m`,'Probability',{
+    barmode:'overlay',showlegend:true,
+    legend:{orientation:'h',y:-0.22,font:{color:TM,size:9}},
+    xaxis:{...AX,title:'Wind speed (m/s)',range:[0,25]},
+  }),PC);
+}
+
+function chartMonthly(rows,m){
+  const yr=(arr,mo)=>[...new Set(arr.filter(r=>r.month===mo).map(r=>r.year))];
+  const mavg=(arr,mo,key)=>{const ys=yr(arr,mo);return ys.length?ys.map(y=>arr.filter(r=>r.month===mo&&r.year===y).reduce((s,r)=>s+r[key],0)/arr.filter(r=>r.month===mo&&r.year===y).length).reduce((a,b)=>a+b,0)/ys.length:0;};
+  const era=MONTHS.map((_,i)=>+mavg(rows,i+1,'ws100').toFixed(2));
+  const cor=MONTHS.map((_,i)=>+mavg(rows,i+1,'wsCor').toFixed(2));
+  Plotly.newPlot('cMonthly',[
+    {type:'scatter',mode:'lines+markers',name:'ERA5 @ 100m',x:MONTHS,y:era,line:{color:TM,width:2},showlegend:true},
+    {type:'scatter',mode:'lines+markers',name:`GWA-corrected @ ${m.hh}m`,x:MONTHS,y:cor,line:{color:BL,width:2.5},showlegend:true},
+  ],tL('Mean Monthly Wind Speed','m/s',{
+    showlegend:true,legend:{orientation:'h',y:-0.22,font:{color:TM,size:9}},
+  }),PC);
+}
+
+function chartDiurnal(rows,m){
+  const byHour=Array.from({length:24},h=>rows.filter(r=>r.lhour===h).map(r=>r.wsCor));
+  const y=byHour.map(a=>a.length?+(a.reduce((s,x)=>s+x,0)/a.length).toFixed(2):0);
+  Plotly.newPlot('cDiurnal',[
+    {type:'scatter',mode:'lines',name:'GWA-corrected',x:[...Array(24).keys()],y,line:{color:BL,width:2.5},showlegend:false},
+  ],tL(`Diurnal Wind Speed @ ${m.hh}m (local time)`,'m/s',{
+    xaxis:{...AX,title:'Local hour',dtick:2},
+  }),PC);
+}
+
+function chartShear(rows,m){
+  const alpha=Array.from({length:24},h=>{
+    const a=rows.filter(r=>r.lhour===h).map(r=>r.alpha);
+    return a.length?+(a.reduce((s,x)=>s+x,0)/a.length).toFixed(3):m.alphaMean;
+  });
+  Plotly.newPlot('cShear',[
+    {type:'scatter',mode:'lines',x:[...Array(24).keys()],y:alpha,line:{color:'#22D3EE',width:2},showlegend:false,fill:'tozeroy',fillcolor:'rgba(34,211,238,0.08)'},
+    {type:'scatter',mode:'lines',x:[0,23],y:[m.alphaMean,m.alphaMean],line:{color:'#E2E8F0',width:1.5,dash:'dot'},showlegend:false},
+  ],tL('Diurnal Wind Shear Exponent α','α (dimensionless)',{
+    xaxis:{...AX,title:'Local hour',dtick:2},
+    yaxis:{...AX,title:'α',range:[0,Math.max(0.5,...alpha)*1.3]},
+    annotations:[{x:12,y:m.alphaMean,text:`GWA mean α=${m.alphaMean.toFixed(3)}`,showarrow:false,font:{color:'#E2E8F0',size:9},yshift:8}],
+  }),PC);
+}
+
+function chartDaily(rows,m){
+  const byDay={};
+  rows.forEach(r=>{const k=r.time?r.time.slice(0,10):`${r.year}-${String(r.month).padStart(2,'0')}-01`;if(!byDay[k])byDay[k]={s:0,n:0};byDay[k].s+=r.wsCor;byDay[k].n++;});
+  const days=Object.keys(byDay).sort();
+  const y=days.map(d=>{const b=byDay[d];return +(b.s/b.n).toFixed(2);});
+  Plotly.newPlot('cDaily',[{type:'scatter',mode:'lines',x:days,y,line:{color:BLM,width:1},showlegend:false}],
+    tL(`Daily Mean Wind Speed @ ${m.hh}m (GWA-corrected)`,'m/s',{
+      xaxis:{...AX,title:''},yaxis:{...AX,title:'m/s'},
+    }),PC);
+}
+
+function renderAEP(aep){
+  document.getElementById('aepGrid').innerHTML=
+    K((aep.grossAEP/1000).toFixed(2),'GWh/yr','Gross AEP')+
+    K((aep.netAEP/1000).toFixed(2),'GWh/yr','Net AEP')+
+    K(aep.cf.toFixed(1)+'%','','Capacity Factor')+
+    K(aep.nameplateMW.toFixed(0),'MW','Nameplate');
+  Plotly.newPlot('cAEP',[{type:'bar',x:MONTHS,y:aep.monthly.map(v=>+v.toFixed(1)),
+    marker:{color:BL},text:aep.monthly.map(v=>v.toFixed(0)),textposition:'outside',
+    textfont:{color:TM,size:9}}],
+    tL('Average Monthly Gross Energy (MWh)','MWh'),PC);
+}
+
+function renderTable(rows,m){
+  const years=[...new Set(rows.map(r=>r.year))].sort();
+  const trs=years.map(yr=>{
+    const r=rows.filter(r=>r.year===yr);
+    const era=+(r.reduce((s,x)=>s+x.ws100,0)/r.length).toFixed(2);
+    const cor=+(r.reduce((s,x)=>s+x.wsCor,0)/r.length).toFixed(2);
+    const raw=+(r.reduce((s,x)=>s+x.wsRaw,0)/r.length).toFixed(2);
+    const al=+(r.reduce((s,x)=>s+x.alpha,0)/r.length).toFixed(3);
+    const rho=+(r.reduce((s,x)=>s+x.rho,0)/r.length).toFixed(4);
+    return `<tr><td>${yr}</td><td>${era}</td><td>${raw}</td><td>${cor}</td><td>${al}</td><td>${rho}</td></tr>`;
+  });
+  document.getElementById('tbl').innerHTML=
+    '<thead><tr><th>Year</th><th>ERA5 @ 100m (m/s)</th><th>ERA5 extrap raw (m/s)</th><th>GWA-corrected (m/s)</th><th>Mean α</th><th>Air density (kg/m³)</th></tr></thead>'
+    +'<tbody>'+trs.join('')+'</tbody>';
+}
+
+// ── CSV download ──────────────────────────────────────────────────────────────
+function dlCSV(){
+  const m=META;
+  const hdr=[
+    '# ERA5 x GWA Wind Synthesis (HTML standalone)',
+    `# Site: (${m.lat.toFixed(4)}, ${m.lon.toFixed(4)})`,
+    `# Period: ${m.sy}-${m.ey} (${m.ny} yr)  Hub height: ${m.hh} m`,
+    `# GWA mean @ hub: ${m.meanCor.toFixed(2)} m/s  A=${m.AG.toFixed(2)} m/s  k=${m.kG.toFixed(2)}`,
+    `# Wind shear alpha (GWA-calibrated): ${m.alphaMean.toFixed(3)}`,
+    `# Mean air density at hub: ${m.meanRho.toFixed(4)} kg/m3`,
+    '#',
+    'datetime_utc,ws_100m_ms,ws_hub_raw_ms,ws_hub_corrected_ms,alpha_h,air_density_kgm3,wd_100m_deg',
+  ].join('\n');
+  const body=ROWS.map(r=>`${r.time},${r.ws100.toFixed(2)},${r.wsRaw.toFixed(2)},${r.wsCor.toFixed(2)},${r.alpha.toFixed(4)},${r.rho.toFixed(4)},${r.wd.toFixed(0)}`).join('\n');
+  const blob=new Blob([hdr+'\n'+body],{type:'text/csv;charset=utf-8;'});
+  const a=Object.assign(document.createElement('a'),{href:URL.createObjectURL(blob),download:`wind_ts_${m.hh}m_${m.sy}_${m.ey}_${m.lat.toFixed(3)}_${m.lon.toFixed(3)}.csv`});
+  a.click();
+}
+</script>
+</body>
+</html>
