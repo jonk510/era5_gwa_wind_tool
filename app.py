@@ -35,6 +35,12 @@ from streamlit_folium import st_folium
 warnings.filterwarnings("ignore")
 
 import os, sys
+# Make the shared library importable when running locally (not pip-installed).
+try:
+    import shared as _shared_pkg  # noqa: F401
+except ModuleNotFoundError:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from shared.timezone_lookup import get_timezone as _get_tz_shared
 
 
