@@ -1416,7 +1416,7 @@ if app_mode == "Batch":
                 _b_wake_df = load_wake_matrix() if _has_aep else None
 
                 if _has_aep and _b_pc_df is None:
-                    st.warning("AEP columns detected but `data/power_curves.xlsx` not found — AEP will be skipped.")
+                    st.warning("AEP columns detected but no power curves found in shared library — AEP will be skipped.")
                     _has_aep = False
 
                 if _has_aep:
@@ -2708,7 +2708,7 @@ if "aep_df" in st.session_state:
 
     if _pc_df is None:
         st.info(
-            "No power curves loaded. Add `data/power_curves.xlsx` to enable AEP calculation. "
+            "No power curves loaded. Update `power_curves.xlsx` in the shared library to enable AEP calculation. "
             "Format: column 1 = wind speed (m/s), remaining columns = power (kW) per WTG, "
             "row 1 = WTG names."
         )
