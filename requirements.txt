@@ -11,4 +11,4 @@ pyproj>=3.6
 openpyxl>=3.1
 matplotlib>=3.9
 contextily>=0.5
-git+https://github.com/jonk510/wind-tools-shared.git@a2cb22f
+git+https://github.com/jonk510/wind-tools-shared.git@426c3a0

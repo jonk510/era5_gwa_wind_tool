@@ -42,6 +42,7 @@ except ModuleNotFoundError:
     import os as _os, sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 from shared.timezone_lookup import get_timezone as _get_tz_shared
+from shared.wtg_presets import load_power_curves
 
 
 def detect_timezone(lat: float, lon: float) -> str:
@@ -432,18 +433,6 @@ def fetch_site_roughness(
 # ── AEP helpers ───────────────────────────────────────────────────────────────
 
 _DATA_DIR = Path(__file__).parent / "data"
-
-
-@st.cache_data(show_spinner=False)
-def load_power_curves() -> pd.DataFrame | None:
-    """Load data/power_curves.xlsx. Returns DataFrame[WTG → kW] indexed by wind speed (m/s)."""
-    p = _DATA_DIR / "power_curves.xlsx"
-    if not p.exists():
-        return None
-    df = pd.read_excel(p, index_col=0, header=0)
-    df.index = df.index.astype(float)
-    df.columns = [str(c).strip() for c in df.columns]  # strip any trailing whitespace from WTG names
-    return df.sort_index()
 
 
 @st.cache_data(show_spinner=False)
