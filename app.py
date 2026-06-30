@@ -2090,21 +2090,21 @@ A **continuous AR(1) process** is then generated at {res_label} timesteps across
                     y=sample_h.values,
                     mode="lines+markers",
                     name="Hourly ERA5+GWA",
-                    line=dict(color="#0F172A", width=2.0, dash="dash"),
+                    line=dict(color="#CCFFCC", width=2.0, dash="dash"),
                     marker=dict(size=4),
                 )
             )
             fig_sub.update_layout(
-                template="plotly_white",
-                title=dict(text=f"{res_label} stochastic disaggregation — 5-day sample (fake)", font=dict(size=13, color="#0F172A")),
+                template="plotly_dark",
+                title=dict(text=f"{res_label} stochastic disaggregation — 5-day sample (fake)", font=dict(size=13)),
                 xaxis_title=f"Date/Time ({tz_display})",
                 yaxis_title=f"Wind Speed @ {hub_height:.0f} m (m/s)",
                 height=320,
                 margin=dict(t=40, b=50, l=55, r=20),
                 legend=dict(orientation="h", y=-0.3),
-                font=dict(color="#64748B", size=11),
-                xaxis=dict(gridcolor="rgba(0,0,0,0.05)"),
-                yaxis=dict(gridcolor="rgba(0,0,0,0.05)"),
+                font=dict(size=11),
+                xaxis=dict(gridcolor="#1A3A1A"),
+                yaxis=dict(gridcolor="#1A3A1A"),
             )
             st.plotly_chart(fig_sub, use_container_width=True)
 
@@ -2211,16 +2211,16 @@ Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** (
             line_color="#94A3B8",
             annotation_text=f"GWA mean α = {meta['alpha_mean']:.3f}",
             annotation_position="top right",
-            annotation_font_color="#64748B",
+            annotation_font_color="#86EFAC",
         )
         fig_alpha.update_layout(
-            template="plotly_white",
-            xaxis=dict(title=f"Hour of Day ({tz_display})", tickmode="linear", tick0=0, dtick=3, gridcolor="rgba(0,0,0,0.05)"),
-            yaxis=dict(title="Shear Exponent α", gridcolor="rgba(0,0,0,0.05)"),
+            template="plotly_dark",
+            xaxis=dict(title=f"Hour of Day ({tz_display})", tickmode="linear", tick0=0, dtick=3, gridcolor="#1A3A1A"),
+            yaxis=dict(title="Shear Exponent α", gridcolor="#1A3A1A"),
             height=280,
             margin=dict(t=15, b=40, l=55, r=20),
             showlegend=False,
-            font=dict(color="#64748B", size=11),
+            font=dict(size=11),
         )
         st.plotly_chart(fig_alpha, use_container_width=True)
         _a50_note = (
@@ -2264,13 +2264,13 @@ Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** (
                 )
             )
         fig_monthly.update_layout(
-            template="plotly_white",
-            xaxis=dict(title="Date", gridcolor="rgba(0,0,0,0.05)"),
-            yaxis=dict(title="Mean Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
+            template="plotly_dark",
+            xaxis=dict(title="Date", gridcolor="#1A3A1A"),
+            yaxis=dict(title="Mean Wind Speed (m/s)", gridcolor="#1A3A1A"),
             height=330,
             margin=dict(t=15, b=60, l=55, r=20),
             legend=dict(orientation="h", y=-0.3),
-            font=dict(color="#64748B", size=11),
+            font=dict(size=11),
         )
         st.plotly_chart(fig_monthly, use_container_width=True)
 
@@ -2297,14 +2297,14 @@ Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** (
                 )
             )
         fig_seasonal.update_layout(
-            template="plotly_white",
+            template="plotly_dark",
             barmode="group",
-            xaxis=dict(title="Month", gridcolor="rgba(0,0,0,0.05)"),
-            yaxis=dict(title="Mean Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
+            xaxis=dict(title="Month", gridcolor="#1A3A1A"),
+            yaxis=dict(title="Mean Wind Speed (m/s)", gridcolor="#1A3A1A"),
             height=300,
             margin=dict(t=15, b=60, l=55, r=20),
             legend=dict(orientation="h", y=-0.3),
-            font=dict(color="#64748B", size=11),
+            font=dict(size=11),
         )
         st.plotly_chart(fig_seasonal, use_container_width=True)
 
@@ -2353,18 +2353,18 @@ Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** (
                     y=pdf_gwa * bin_w,
                     mode="lines",
                     name="GWA Weibull target",
-                    line=dict(color="#0F172A", width=2.0, dash="dash"),
+                    line=dict(color="#CCFFCC", width=2.0, dash="dash"),
                 )
             )
             fig_wb.update_layout(
-                template="plotly_white",
+                template="plotly_dark",
                 barmode="overlay",
-                xaxis=dict(title="Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
-                yaxis=dict(title="Probability", gridcolor="rgba(0,0,0,0.05)"),
+                xaxis=dict(title="Wind Speed (m/s)", gridcolor="#1A3A1A"),
+                yaxis=dict(title="Probability", gridcolor="#1A3A1A"),
                 height=330,
                 margin=dict(t=15, b=60, l=55, r=20),
                 legend=dict(orientation="h", y=-0.3),
-                font=dict(color="#64748B", size=11),
+                font=dict(size=11),
             )
             st.plotly_chart(fig_wb, use_container_width=True)
             st.markdown(f"""
@@ -2400,13 +2400,13 @@ Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** (
                 line=dict(color="#10B981", width=0.8, dash="dot"),
             ))
         fig_ts.update_layout(
-            template="plotly_white",
-            xaxis=dict(title="Date", gridcolor="rgba(0,0,0,0.05)"),
-            yaxis=dict(title="Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
+            template="plotly_dark",
+            xaxis=dict(title="Date", gridcolor="#1A3A1A"),
+            yaxis=dict(title="Wind Speed (m/s)", gridcolor="#1A3A1A"),
             height=310,
             margin=dict(t=15, b=60, l=55, r=20),
             legend=dict(orientation="h", y=-0.3),
-            font=dict(color="#64748B", size=11),
+            font=dict(size=11),
         )
         st.plotly_chart(fig_ts, use_container_width=True)
         if df_sub is not None:
@@ -2454,17 +2454,17 @@ Displayed diurnal range (hourly mean): **{alpha_min:.3f} – {alpha_max:.3f}** (
             ))
 
             fig_day.update_layout(
-                template="plotly_white",
+                template="plotly_dark",
                 xaxis=dict(
                     title=f"Time ({tz_display})",
-                    gridcolor="rgba(0,0,0,0.05)",
+                    gridcolor="#1A3A1A",
                     tickformat="%H:%M",
                 ),
-                yaxis=dict(title="Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
+                yaxis=dict(title="Wind Speed (m/s)", gridcolor="#1A3A1A"),
                 height=340,
                 margin=dict(t=15, b=60, l=55, r=20),
                 legend=dict(orientation="h", y=-0.3),
-                font=dict(color="#64748B", size=11),
+                font=dict(size=11),
             )
             st.plotly_chart(fig_day, use_container_width=True)
             st.markdown(f"""
@@ -2756,13 +2756,13 @@ if "aep_df" in st.session_state:
             name=f"{_selected_wtg} — scaled to {_nameplate_mw:.1f} MW",
         ))
         _fig_pc.update_layout(
-            template="plotly_white",
-            xaxis=dict(title="Wind Speed (m/s)", gridcolor="rgba(0,0,0,0.05)"),
-            yaxis=dict(title="Power (MW)", gridcolor="rgba(0,0,0,0.05)"),
+            template="plotly_dark",
+            xaxis=dict(title="Wind Speed (m/s)", gridcolor="#1A3A1A"),
+            yaxis=dict(title="Power (MW)", gridcolor="#1A3A1A"),
             height=240,
             margin=dict(t=10, b=40, l=55, r=20),
             legend=dict(orientation="h", y=-0.4),
-            font=dict(color="#64748B", size=11),
+            font=dict(size=11),
         )
         st.plotly_chart(_fig_pc, use_container_width=True)
 
@@ -2867,14 +2867,14 @@ if "aep_df" in st.session_state:
             name="Net energy (after all losses)", marker_color="rgba(79,70,229,0.7)",
         ))
         _fig_maep.update_layout(
-            template="plotly_white",
+            template="plotly_dark",
             barmode="overlay",
-            xaxis=dict(title="Month", gridcolor="rgba(0,0,0,0.05)"),
-            yaxis=dict(title="Mean Monthly Energy (MWh)", gridcolor="rgba(0,0,0,0.05)"),
+            xaxis=dict(title="Month", gridcolor="#1A3A1A"),
+            yaxis=dict(title="Mean Monthly Energy (MWh)", gridcolor="#1A3A1A"),
             height=290,
             margin=dict(t=10, b=60, l=55, r=20),
             legend=dict(orientation="h", y=-0.3),
-            font=dict(color="#64748B", size=11),
+            font=dict(size=11),
         )
         st.plotly_chart(_fig_maep, use_container_width=True)
 
