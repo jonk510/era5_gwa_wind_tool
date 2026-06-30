@@ -11,7 +11,18 @@ long-term record.
 
 import io
 import re
+import os
+import sys
 from datetime import datetime
+
+# Make the shared library importable when running locally (not pip-installed).
+# This page lives in <tool>/pages/, so the repo root that holds shared/ is three
+# directory levels up. On Streamlit Cloud `shared` is pip-installed, so the
+# fallback never runs.
+try:
+    import shared as _shared_pkg  # noqa: F401
+except ModuleNotFoundError:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -21,6 +32,7 @@ import pandas as pd
 import streamlit as st
 from scipy.optimize import minimize_scalar
 from report_gen import generate_calibration_pdf
+from shared.fulcrum import load_fulcrum_wind, wind_speed_series
 
 st.set_page_config(
     page_title="Calibration — ERA5 × GWA",
@@ -977,29 +989,91 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("### 2 — Measured wind speed")
 
-meas_upload = st.file_uploader(
-    "Upload measured wind speed CSV or WindPRO export",
-    type=["csv", "txt"],
-    help="Accepts: (1) any CSV with datetime index + wind speed column in m/s; "
-         "(2) WindPRO time-series export CSV (auto-detected); "
-         "(3) WindPRO Meteo Data Export .txt (auto-detected). "
-         "'#' comment header lines are skipped automatically.",
-    key="calib_meas_file",
+meas_source = st.radio(
+    "Measured data source",
+    ["CSV / WindPRO export", "Fulcrum3D SODAR"],
+    horizontal=True,
+    key="calib_meas_source",
+    help="Upload a generic CSV / WindPRO export, or a Fulcrum3D SODAR record "
+         "(raw or processed, CSV or ZIP) — parsed with the same loader the SODAR "
+         "Data Tool uses.",
 )
 
 meas_full: pd.Series | None = None
 
-if meas_upload:
-    meas_hint = st.text_input(
-        "Measured wind speed column (leave blank to auto-detect)", value="", key="calib_meas_col"
+if meas_source == "CSV / WindPRO export":
+    meas_upload = st.file_uploader(
+        "Upload measured wind speed CSV or WindPRO export",
+        type=["csv", "txt"],
+        help="Accepts: (1) any CSV with datetime index + wind speed column in m/s; "
+             "(2) WindPRO time-series export CSV (auto-detected); "
+             "(3) WindPRO Meteo Data Export .txt (auto-detected). "
+             "'#' comment header lines are skipped automatically.",
+        key="calib_meas_file",
     )
-    meas_full, meas_col = _load_series(meas_upload, meas_hint or None)
-    if meas_full is not None:
-        st.caption(
-            f"Column **{meas_col}** · {len(meas_full):,} records · "
-            f"{meas_full.index[0].date()} → {meas_full.index[-1].date()} · "
-            f"mean {meas_full.mean():.2f} m/s"
+
+    if meas_upload:
+        meas_hint = st.text_input(
+            "Measured wind speed column (leave blank to auto-detect)", value="", key="calib_meas_col"
         )
+        meas_full, meas_col = _load_series(meas_upload, meas_hint or None)
+        if meas_full is not None:
+            st.caption(
+                f"Column **{meas_col}** · {len(meas_full):,} records · "
+                f"{meas_full.index[0].date()} → {meas_full.index[-1].date()} · "
+                f"mean {meas_full.mean():.2f} m/s"
+            )
+else:
+    # ── Fulcrum3D SODAR upload (shared loader) ───────────────────────────────
+    sodar_uploads = st.file_uploader(
+        "Upload Fulcrum3D SODAR file(s) — CSV or ZIP",
+        type=["csv", "zip"],
+        accept_multiple_files=True,
+        help="Raw or client-processed FlightDECK exports. Wind speed is read at the "
+             "height you select. Timestamps are UTC — use the timezone alignment "
+             "below to match the model's local time.",
+        key="calib_sodar_files",
+    )
+    if sodar_uploads:
+        with st.spinner("Parsing Fulcrum3D data…"):
+            wind_ds, info = load_fulcrum_wind(sodar_uploads)
+
+        if wind_ds is None:
+            extra = (f" {len(info['unknown'])} file(s) could not be parsed."
+                     if info["unknown"] else "")
+            st.error("No wind profile data found in the uploaded file(s)." + extra)
+        else:
+            heights = wind_ds["heights"]
+            # Default to the height matching the model hub height, else the tallest
+            default_idx = len(heights) - 1
+            if isinstance(hub_h, int) and hub_h in heights:
+                default_idx = heights.index(hub_h)
+            sel_h = st.selectbox(
+                "Measurement height (m)", heights, index=default_idx,
+                key="calib_sodar_height",
+                help="SODAR measurement height to calibrate against — choose the one "
+                     "closest to the model hub height.",
+            )
+            ver = None
+            versions = [v for v in info["versions"] if v]
+            if len(versions) > 1:
+                ver = st.selectbox(
+                    "Algorithm version", versions, key="calib_sodar_ver",
+                    help="Multiple FlightDECK algorithm versions were uploaded — "
+                         "pick which to calibrate against.",
+                )
+            meas_full = wind_speed_series(wind_ds, sel_h, version=ver)
+            if meas_full is None or meas_full.empty:
+                st.error(f"No valid wind speed data at {sel_h} m.")
+                meas_full = None
+            else:
+                _fmt = "raw" if wind_ds["is_raw"] else "processed"
+                st.caption(
+                    f"Fulcrum3D **{_fmt}** · {info['n_wind_files']} wind file(s) · "
+                    f"height **{sel_h} m** · {len(meas_full):,} records · "
+                    f"{meas_full.index[0].date()} → {meas_full.index[-1].date()} · "
+                    f"mean {meas_full.mean():.2f} m/s · timestamps UTC"
+                )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gate: need both datasets to proceed
